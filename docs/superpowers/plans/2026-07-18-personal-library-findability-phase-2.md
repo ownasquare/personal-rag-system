@@ -362,12 +362,12 @@ docker compose --env-file .env.example build
 git diff --check
 ```
 
-- [ ] **Step 3: Write completion records and handoff**
+- [x] **Step 3: Write completion records and handoff**
 
 Read the post-chat handoff rule, perform the complete next-item inventory, create the canonical
 12-section `.mdc` plus repo-local pointer, and record exact commit/proof boundaries.
 
-- [ ] **Step 4: Commit locally**
+- [x] **Step 4: Commit locally**
 
 Commit the validated implementation and a documentation-only closeout. No remote is configured;
 report committed locally and not pushed.

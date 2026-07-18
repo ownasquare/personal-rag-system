@@ -120,5 +120,6 @@ with any unrelated schema/profile change rather than treating source rollback as
   `docs/operations.md`, `docs/security.md`, `docs/validation.md`
 - Final canonical handoff: `/Users/fortunevieyra/Documents/Github/beladed.com/docs/handoffs/2026-07-18-codex-personal-library-findability-phase-2.handoff.mdc`
 
-The immutable implementation commit is recorded in the final handoff after this completion record
-is included in the local commit.
+Immutable implementation commit:
+`91df54b77631e15823f7c6feefa413baef57e1e7`. The repo-local pointer and canonical final handoff are
+added in the documentation-only closeout commit.
