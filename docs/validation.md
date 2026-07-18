@@ -43,8 +43,8 @@ the primary workspace. The fixed light theme is intentional; dark-mode proof is 
 
 ### Container proof
 
-A fresh no-cache image build produced
-`sha256:26641d37abcf69dc34ab9c5acad9fd7b35b61044930007584d524ae4569d44b1`.
+A fresh no-cache image build from commit `87c52f7` produced
+`sha256:e5dfd70f605c065228d9ab4c20d540b07ba26d76446ccba0cdda3e8866431c14`.
 The Docker image listing fell from 2.04 GB to 1.26 GB after removing the package-manager cache. The
 runtime user was the non-root `rag` account.
 
