@@ -2,7 +2,7 @@
 
 ## Product boundary
 
-Personal Knowledge Studio is a production-grade, single-user, single-host RAG system. It is
+Personal Library is a production-grade, single-user, single-host RAG system. It is
 designed for a laptop, workstation, or one private server. It is not represented as a highly
 available multi-tenant SaaS system: PostgreSQL, an external queue, object storage, distributed
 locks, tenant authorization, and horizontal worker coordination would be required before that
@@ -24,7 +24,7 @@ The production-shaped deployment contains four services:
 flowchart LR
   U["User browser"] --> UI["Streamlit"]
   UI -->|"Bearer-authenticated HTTP"| API["FastAPI"]
-  API --> DB[("SQLite WAL manifest/jobs")]
+  API --> DB[("SQLite WAL manifest/jobs/conversations")]
   API --> RAW[("Private upload volume")]
   W["Durable worker"] --> DB
   W --> RAW
@@ -71,15 +71,41 @@ document from normal retrieval. The worker deletes exact Qdrant records, verifie
 and removes the retained source file. Only then does it mark the document `deleted`; partial
 failure becomes `deletion_failed` and remains retryable.
 
+Before that delete job commits success, SQLite removes each entire saved turn whose normalized
+citation records reference the deleted document. Empty affected conversations are hard-deleted;
+non-empty affected conversations are retitled from their first remaining completed question. The
+purge and document/job terminal state share one transaction, so the system cannot report a
+privacy-complete deletion while cited answer content remains in the active database.
+
+### Durable conversation turns
+
+1. The UI creates a conversation only when the first question is submitted.
+2. FastAPI atomically reserves the client turn ID and request fingerprint before any paid provider
+   call. The active request owns a random reservation token and renews its lease while provider
+   work runs; a recovered request receives a new token.
+3. The RAG request history is reconstructed from a bounded window of completed persisted turns;
+   pending and failed turns never enter model context.
+4. A successful answer and its normalized citation records commit together only if the current
+   reservation token still owns the turn and every cited document is still retrieval-ready in
+   that same SQLite transaction. Retryable failures retain only the question, scope, safe error
+   code, and reservation state—never provider exception text.
+5. Completed duplicates return the saved turn. Active duplicates return a retryable conflict, and
+   expired or retryable failed reservations can be reclaimed with the same fingerprint. Ownership
+   fencing prevents a late result from an older attempt from completing or failing the reclaimed
+   turn.
+
 ## State ownership
 
 - SQLite is authoritative for document visibility, job state, deduplication, idempotency,
-  failure details, worker heartbeat, and the active embedding profile.
+  saved conversations/turns/citations, safe failure details, worker heartbeat, and the active
+  embedding profile.
 - Qdrant is authoritative only for vector records. It does not decide whether an ingestion or
   deletion operation is complete.
 - The upload volume is private application state. No raw-file route is exposed.
-- Streamlit session state owns transient presentation history only. A browser refresh re-reads
-  document and job truth from FastAPI.
+- Streamlit session state owns only navigation, unsubmitted draft text, and immediate presentation
+  hints. A browser refresh re-reads documents, jobs, conversations, turns, and citations from
+  FastAPI. The Activity page refreshes on demand instead of maintaining an idle polling loop after
+  work is terminal.
 
 ## Embedding compatibility
 

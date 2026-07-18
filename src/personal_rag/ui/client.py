@@ -14,9 +14,16 @@ from personal_rag.config import Settings
 from personal_rag.models import (
     ChatRequest,
     ChatResponse,
+    ConversationCreate,
+    ConversationList,
+    ConversationSummary,
+    ConversationTurn,
+    ConversationTurnCreate,
+    ConversationTurnList,
     DocumentList,
     DocumentPublic,
     ErrorEnvelope,
+    JobList,
     JobRecord,
     JobStatus,
     SystemStatus,
@@ -118,14 +125,10 @@ class RagApiClient:
         return self._parse_model(data, SystemStatus)
 
     def list_documents(self, *, limit: int = 100, offset: int = 0) -> DocumentList:
-        if limit < 1 or limit > 100:
-            raise ValueError("limit must be between 1 and 100")
-        if offset < 0:
-            raise ValueError("offset must not be negative")
         data = self._request_json(
             "GET",
             "/api/v1/documents",
-            params={"limit": limit, "offset": offset},
+            params=self._pagination_params(limit=limit, offset=offset),
         )
         return self._parse_model(data, DocumentList)
 
@@ -186,6 +189,78 @@ class RagApiClient:
         )
         return self._parse_model(data, ChatResponse)
 
+    def create_conversation(self, title: str | None = None) -> ConversationSummary:
+        body = ConversationCreate(title=title)
+        data = self._request_json(
+            "POST",
+            "/api/v1/conversations",
+            json_body=body.model_dump(mode="json", exclude_none=True),
+        )
+        return self._parse_model(data, ConversationSummary)
+
+    def list_conversations(self, *, limit: int = 50, offset: int = 0) -> ConversationList:
+        data = self._request_json(
+            "GET",
+            "/api/v1/conversations",
+            params=self._pagination_params(limit=limit, offset=offset),
+        )
+        return self._parse_model(data, ConversationList)
+
+    def get_conversation(self, conversation_id: str) -> ConversationSummary:
+        data = self._request_json(
+            "GET",
+            f"/api/v1/conversations/{self._path_identifier(conversation_id)}",
+        )
+        return self._parse_model(data, ConversationSummary)
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        self._request_json(
+            "DELETE",
+            f"/api/v1/conversations/{self._path_identifier(conversation_id)}",
+        )
+
+    def list_conversation_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> ConversationTurnList:
+        data = self._request_json(
+            "GET",
+            f"/api/v1/conversations/{self._path_identifier(conversation_id)}/turns",
+            params=self._pagination_params(limit=limit, offset=offset),
+        )
+        return self._parse_model(data, ConversationTurnList)
+
+    def create_conversation_turn(
+        self,
+        conversation_id: str,
+        turn: ConversationTurnCreate,
+    ) -> ConversationTurn:
+        data = self._request_json(
+            "POST",
+            f"/api/v1/conversations/{self._path_identifier(conversation_id)}/turns",
+            json_body=turn.model_dump(mode="json", exclude_none=True),
+        )
+        return self._parse_model(data, ConversationTurn)
+
+    def list_jobs(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        status: JobStatus | None = None,
+        document_id: str | None = None,
+    ) -> JobList:
+        params: dict[str, str | int] = self._pagination_params(limit=limit, offset=offset)
+        if status is not None:
+            params["status"] = JobStatus(status).value
+        if document_id is not None:
+            params["document_id"] = self._identifier(document_id)
+        data = self._request_json("GET", "/api/v1/jobs", params=params)
+        return self._parse_model(data, JobList)
+
     def wait_for_job(
         self,
         job_id: str,
@@ -218,18 +293,30 @@ class RagApiClient:
             sleeper(min(poll_seconds, max(0.1, deadline - now)))
 
     @staticmethod
-    def _path_identifier(value: str) -> str:
+    def _pagination_params(*, limit: int, offset: int) -> dict[str, str | int]:
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
+        if offset < 0:
+            raise ValueError("offset must not be negative")
+        return {"limit": limit, "offset": offset}
+
+    @staticmethod
+    def _identifier(value: str) -> str:
         cleaned = value.strip()
         if not cleaned:
             raise ValueError("identifier must not be empty")
-        return quote(cleaned, safe="")
+        return cleaned
+
+    @classmethod
+    def _path_identifier(cls, value: str) -> str:
+        return quote(cls._identifier(value), safe="")
 
     def _request_json(
         self,
         method: str,
         path: str,
         *,
-        params: Mapping[str, int] | None = None,
+        params: Mapping[str, str | int] | None = None,
         json_body: object | None = None,
         files: Mapping[str, tuple[str, bytes, str]] | None = None,
     ) -> object:

@@ -1,12 +1,12 @@
 [theme]
 base = "light"
-primaryColor = "#2563EB"
-backgroundColor = "#F8FAFC"
-secondaryBackgroundColor = "#EEF2FF"
-textColor = "#172033"
+primaryColor = "#3F654F"
+backgroundColor = "#F5F2EB"
+secondaryBackgroundColor = "#ECE8DE"
+textColor = "#272922"
 font = "sans-serif"
-baseRadius = "large"
-buttonRadius = "large"
+baseRadius = "medium"
+buttonRadius = "medium"
 
 [server]
 headless = true

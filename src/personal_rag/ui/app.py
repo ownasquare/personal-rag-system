@@ -1,50 +1,48 @@
-"""Polished Streamlit shell for the Personal Knowledge Studio."""
+"""Calm Streamlit workspace for the private Personal Library."""
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Protocol, cast
+from uuid import uuid4
 
 import streamlit as st
 
 from personal_rag.config import Settings, get_settings
 from personal_rag.models import (
-    ChatHistoryMessage,
-    ChatRequest,
-    ChatResponse,
     Citation,
+    ConversationList,
+    ConversationSummary,
+    ConversationTurn,
+    ConversationTurnCreate,
+    ConversationTurnList,
+    ConversationTurnStatus,
     DocumentPublic,
     DocumentStatus,
+    JobList,
     JobRecord,
     JobStatus,
     SystemStatus,
     UploadReceipt,
 )
 from personal_rag.ui.client import ApiClientError, HealthCheck, RagApiClient
+from personal_rag.ui.presentation import (
+    HEADER_HTML,
+    ONBOARDING_STEPS_HTML,
+    STATIC_STYLES,
+    document_status_label,
+    format_bytes,
+    job_action_label,
+    job_status_label,
+)
 
 SUPPORTED_FILE_TYPES = ["pdf", "docx", "md", "txt"]
+WORKSPACE_SECTIONS = ("Ask", "Documents", "Activity", "System")
 TERMINAL_JOB_STATUSES = {JobStatus.SUCCEEDED, JobStatus.FAILED}
-STATIC_STYLES = """
-<style>
-  .stApp { background: linear-gradient(180deg, rgba(37, 99, 235, 0.055), transparent 18rem); }
-  .block-container { max-width: 1240px; padding-top: 2.25rem; padding-bottom: 4rem; }
-  div[data-testid="stMetric"] {
-    border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
-    border-radius: 0.9rem;
-    padding: 0.8rem 1rem;
-    background: color-mix(in srgb, var(--background-color) 94%, currentColor 6%);
-  }
-  div[data-testid="stFileUploader"] section { border-radius: 0.9rem; }
-  div[data-testid="stExpander"] { border-radius: 0.8rem; overflow: hidden; }
-  div[data-testid="stChatMessage"] { border-radius: 0.9rem; }
-  .stTabs [data-baseweb="tab-list"] { gap: 0.4rem; }
-  .stTabs [data-baseweb="tab"] { border-radius: 0.75rem 0.75rem 0 0; padding-inline: 1rem; }
-  @media (max-width: 640px) {
-    .block-container { padding: 1.25rem 1rem 3rem; }
-    .stTabs [data-baseweb="tab"] { padding-inline: 0.55rem; font-size: 0.86rem; }
-  }
-</style>
-"""
+MAX_CONVERSATIONS = 2_000
+TURN_WINDOW = 100
+_MARKDOWN_CONTROL = re.compile(r"([\\`*_{}\[\]()#+!|>])")
 
 
 class UiClient(Protocol):
@@ -64,11 +62,38 @@ class UiClient(Protocol):
 
     def get_job(self, job_id: str) -> JobRecord: ...
 
+    def list_jobs(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        status: JobStatus | None = None,
+        document_id: str | None = None,
+    ) -> JobList: ...
+
     def reindex_document(self, document_id: str) -> JobRecord: ...
 
     def delete_document(self, document_id: str) -> JobRecord: ...
 
-    def chat(self, request: ChatRequest) -> ChatResponse: ...
+    def create_conversation(self, title: str | None = None) -> ConversationSummary: ...
+
+    def list_conversations(self, *, limit: int = 50, offset: int = 0) -> ConversationList: ...
+
+    def delete_conversation(self, conversation_id: str) -> None: ...
+
+    def list_conversation_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> ConversationTurnList: ...
+
+    def create_conversation_turn(
+        self,
+        conversation_id: str,
+        turn: ConversationTurnCreate,
+    ) -> ConversationTurn: ...
 
 
 @st.cache_resource(show_spinner=False)
@@ -91,10 +116,29 @@ def _resolve_client() -> UiClient:
 
 
 def _initialize_state() -> None:
-    st.session_state.setdefault("chat_history", [])
     st.session_state.setdefault("tracked_jobs", {})
-    st.session_state.setdefault("chat_error", None)
-    st.session_state.setdefault("chat_draft_version", 0)
+    st.session_state.setdefault("selected_conversation_id", None)
+    st.session_state.setdefault("starting_new_conversation", False)
+    st.session_state.setdefault("confirm_delete_conversation", False)
+    st.session_state.setdefault("question_draft_version", 0)
+    st.session_state.setdefault("pending_client_turn_id", None)
+    st.session_state.setdefault("pending_turn_payload", None)
+    st.session_state.setdefault("turn_error", None)
+    st.session_state.setdefault("activity_notice", None)
+    st.session_state.setdefault("activity_errors", [])
+
+
+def _apply_requested_section() -> None:
+    requested = st.session_state.pop("_next_section", None)
+    if requested in WORKSPACE_SECTIONS:
+        st.session_state["workspace_section"] = requested
+
+
+def _request_section(section: str) -> None:
+    if section not in WORKSPACE_SECTIONS:
+        raise ValueError(f"Unknown workspace section: {section}")
+    st.session_state["_next_section"] = section
+    st.rerun()
 
 
 def _safe_status(client: UiClient) -> tuple[SystemStatus | None, ApiClientError | None]:
@@ -113,293 +157,116 @@ def _safe_documents(
         return [], exc
 
 
+def _safe_conversations(
+    client: UiClient,
+) -> tuple[ConversationList | None, ApiClientError | None]:
+    try:
+        page_size = 100
+        first = client.list_conversations(limit=page_size, offset=0)
+        items = list(first.items)
+        while len(items) < min(first.total, MAX_CONVERSATIONS):
+            page = client.list_conversations(
+                limit=min(page_size, MAX_CONVERSATIONS - len(items)),
+                offset=len(items),
+            )
+            if not page.items:
+                break
+            items.extend(page.items)
+        return first.model_copy(update={"items": items}), None
+    except ApiClientError as exc:
+        return None, exc
+
+
+def _safe_turns(
+    client: UiClient,
+    conversation_id: str,
+) -> tuple[ConversationTurnList | None, ApiClientError | None]:
+    try:
+        first = client.list_conversation_turns(conversation_id, limit=TURN_WINDOW, offset=0)
+        if first.total <= TURN_WINDOW:
+            return first, None
+        return (
+            client.list_conversation_turns(
+                conversation_id,
+                limit=TURN_WINDOW,
+                offset=first.total - TURN_WINDOW,
+            ),
+            None,
+        )
+    except ApiClientError as exc:
+        return None, exc
+
+
+def _safe_jobs(client: UiClient) -> tuple[JobList | None, ApiClientError | None]:
+    try:
+        return client.list_jobs(limit=100), None
+    except ApiClientError as exc:
+        return None, exc
+
+
 def _providers_configured(status: SystemStatus | None) -> bool:
     if status is None or status.status == "needs_setup":
         return False
     return not any(dependency.status == "not_configured" for dependency in status.dependencies)
 
 
-def _format_bytes(size_bytes: int) -> str:
-    value = float(size_bytes)
-    units = ("B", "KB", "MB", "GB")
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-        value /= 1024
-    return f"{value:.1f} GB"
+def _escape_markdown(value: str) -> str:
+    return _MARKDOWN_CONTROL.sub(r"\\\1", value)
 
 
-def _track_job(job: JobRecord, *, document_name: str, action: str) -> None:
+def _render_header() -> None:
+    # These are trusted static fragments. Document-derived values never enter unsafe HTML.
+    st.markdown(HEADER_HTML, unsafe_allow_html=True)
+
+
+def _render_navigation() -> str:
+    section = st.segmented_control(
+        "Workspace",
+        options=WORKSPACE_SECTIONS,
+        default=None if "workspace_section" in st.session_state else "Ask",
+        selection_mode="single",
+        label_visibility="collapsed",
+        key="workspace_section",
+        width="stretch",
+    )
+    return section if isinstance(section, str) else "Ask"
+
+
+def _track_job(job: JobRecord, *, document_name: str) -> None:
     tracked_jobs = cast("dict[str, dict[str, object]]", st.session_state["tracked_jobs"])
     tracked_jobs[job.id] = {
-        "id": job.id,
+        "document_id": job.document_id,
         "document_name": document_name,
-        "action": action,
+        "kind": job.kind.value,
         "status": job.status.value,
-        "stage": job.stage.value,
-        "progress": job.progress,
     }
 
 
-def _render_job_tracker(client: UiClient, poll_seconds: float) -> None:
-    tracked_jobs = cast("dict[str, dict[str, object]]", st.session_state["tracked_jobs"])
-    if not tracked_jobs:
-        return
-
-    polling_active = any(
-        tracked.get("status") not in {status.value for status in TERMINAL_JOB_STATUSES}
-        for tracked in tracked_jobs.values()
-    )
-
-    @st.fragment(run_every=poll_seconds if polling_active else None)
-    def job_tracker_fragment() -> None:
-        current_jobs = cast("dict[str, dict[str, object]]", st.session_state["tracked_jobs"])
-        if not current_jobs:
-            return
-
-        st.subheader("Processing activity", anchor=False)
-        for job_id, tracked in list(current_jobs.items()):
-            try:
-                job = client.get_job(job_id)
-            except ApiClientError as exc:
-                st.warning(f"Could not refresh this job: {exc.message}")
-                continue
-
-            tracked.update(
-                status=job.status.value,
-                stage=job.stage.value,
-                progress=job.progress,
-            )
-            document_name = str(tracked.get("document_name", "document"))
-            action = str(tracked.get("action", "Processing"))
-            with st.container(border=True):
-                st.markdown(f"**{action} {document_name}**")
-                if job.status == JobStatus.SUCCEEDED:
-                    st.success("Complete. The library will reflect server truth on refresh.")
-                elif job.status == JobStatus.FAILED:
-                    st.error(
-                        "Processing failed. Review the document details and retry if appropriate."
-                    )
-                    if job.error_code:
-                        st.caption(f"Error code: {job.error_code}")
-                else:
-                    st.progress(job.progress, text=job.stage.value.replace("_", " ").title())
-                    st.caption("This job is stored by the API and continues if this page closes.")
-                if st.button(
-                    "Dismiss",
-                    key=f"dismiss-job-{job_id}",
-                    disabled=job.status not in TERMINAL_JOB_STATUSES,
-                ):
-                    current_jobs.pop(job_id, None)
-                    st.rerun()
-
-    job_tracker_fragment()
-
-
-def _render_header(status: SystemStatus | None, status_error: ApiClientError | None) -> None:
-    heading, state = st.columns([4, 1], vertical_alignment="center")
-    with heading:
-        st.title("Personal Knowledge Studio")
-        st.caption(
-            "Upload private reference material, search your library, and get grounded answers "
-            "with source citations."
-        )
-    with state:
-        if status_error is not None:
-            st.error("API unavailable")
-        elif status is not None and status.status == "ready":
-            st.success("System ready")
-        elif status is not None and status.status == "needs_setup":
-            st.warning("Setup needed")
-        else:
-            st.warning("System degraded")
-
-
-def _render_provider_blocker() -> None:
-    st.warning(
-        "Provider setup required. Configure the embedding and answer-provider "
-        "credentials on the server, then refresh this page."
-    )
-
-
-def _render_chat(
+def _render_upload(
     client: UiClient,
     settings: Settings,
-    status: SystemStatus | None,
-    documents: list[DocumentPublic],
-    documents_error: ApiClientError | None,
+    *,
+    key_prefix: str,
+    heading: str | None = None,
 ) -> None:
-    st.subheader("Chat with your knowledge", anchor=False)
-    st.caption("Answers are grounded in ready documents; citations come directly from the API.")
-
-    history = cast("list[dict[str, object]]", st.session_state["chat_history"])
-    toolbar_left, toolbar_right = st.columns([3, 1], vertical_alignment="center")
-    with toolbar_left:
-        st.caption(f"{len(history) // 2} answered question(s) in this session")
-    with toolbar_right:
-        if st.button("Clear chat", width="stretch", disabled=not history):
-            history.clear()
-            st.session_state["chat_error"] = None
-            st.session_state["chat_draft_version"] += 1
-            st.rerun()
-
-    for message in history:
-        role = str(message.get("role", "assistant"))
-        safe_role = role if role in {"user", "assistant"} else "assistant"
-        with st.chat_message(safe_role):
-            st.write(str(message.get("content", "")))
-            if safe_role == "assistant":
-                _render_citations(message.get("citations", []))
-
-    error_state = st.session_state.get("chat_error")
-    if isinstance(error_state, dict):
-        st.error(str(error_state.get("message", "The question could not be answered.")))
-        if bool(error_state.get("retryable")):
-            st.caption(
-                "You can retry without retyping; your question and chat history are preserved."
-            )
-
-    if documents_error is not None:
-        st.error(documents_error.message)
-        return
-    if status is None:
-        st.warning("System status is unavailable. Restore API connectivity before chatting.")
-        return
-    if not _providers_configured(status):
-        _render_provider_blocker()
-        return
-
-    ready_documents = [
-        document for document in documents if document.status == DocumentStatus.READY
-    ]
-    if not documents:
-        st.markdown("### Add your first document")
-        st.info("Open Library, select one or more files, then choose Add to library.")
-        return
-    if not ready_documents:
-        st.info("Your library is processing. Chat becomes available when a document is ready.")
-        return
-
-    document_names = {document.id: document.display_name for document in ready_documents}
-    top_k = st.slider(
-        "Sources to retrieve",
-        min_value=1,
-        max_value=settings.retrieval_max_top_k,
-        value=min(settings.retrieval_top_k, settings.retrieval_max_top_k),
-        help="More sources can improve recall but may add less-relevant context.",
-    )
-    selected_document_ids = st.multiselect(
-        "Search within (optional)",
-        options=list(document_names),
-        format_func=lambda document_id: document_names[document_id],
-        help="Leave empty to search every ready document.",
-    )
-
-    with st.form("chat-question-form", clear_on_submit=False):
-        question = st.text_area(
-            "Ask about your library",
-            key=f"chat_draft_{st.session_state['chat_draft_version']}",
-            placeholder="What do my notes say about…",
-            max_chars=settings.max_query_characters,
-            height=100,
-        )
-        submitted = st.form_submit_button("Ask library", type="primary", width="stretch")
-
-    if not submitted:
-        return
-    cleaned_question = question.strip()
-    if not cleaned_question:
-        st.warning("Enter a question before asking the library.")
-        return
-
-    history_window = (
-        history[-settings.max_history_messages :] if settings.max_history_messages else []
-    )
-    api_history = [
-        ChatHistoryMessage(
-            role="user" if str(item.get("role")) == "user" else "assistant",
-            content=str(item.get("content", "")),
-        )
-        for item in history_window
-        if str(item.get("content", "")).strip()
-    ]
-    request = ChatRequest(
-        message=cleaned_question,
-        history=api_history,
-        top_k=top_k,
-        document_ids=selected_document_ids or None,
-    )
-    try:
-        with st.spinner("Searching your library and checking sources…"):
-            response = client.chat(request)
-    except ApiClientError as exc:
-        st.session_state["chat_error"] = {
-            "message": exc.message,
-            "retryable": exc.retryable,
-            "request_id": exc.request_id,
-        }
-        st.rerun()
-
-    history.extend(
-        [
-            {"role": "user", "content": cleaned_question, "citations": []},
-            {
-                "role": "assistant",
-                "content": response.answer,
-                "citations": [citation.model_dump(mode="json") for citation in response.citations],
-                "no_answer": response.no_answer,
-            },
-        ]
-    )
-    st.session_state["chat_error"] = None
-    st.session_state["chat_draft_version"] += 1
-    st.rerun()
-
-
-def _render_citations(raw_citations: object) -> None:
-    if not isinstance(raw_citations, list):
-        return
-    citations: list[Citation] = []
-    for raw_citation in raw_citations:
-        try:
-            citations.append(Citation.model_validate(raw_citation))
-        except (TypeError, ValueError):
-            continue
-    if not citations:
-        return
-
-    st.caption("Sources")
-    for citation in citations:
-        with st.expander(f"{citation.label} · {citation.document_name}"):
-            metadata: list[str] = []
-            if citation.page_number is not None:
-                metadata.append(f"Page {citation.page_number}")
-            if citation.section:
-                metadata.append(citation.section)
-            if citation.score is not None:
-                metadata.append(f"Relevance {citation.score:.2f}")
-            if metadata:
-                st.caption(" · ".join(metadata))
-            # Document-derived text always uses Streamlit's escaped text renderer.
-            st.write(citation.snippet)
-
-
-def _render_upload(client: UiClient, settings: Settings) -> None:
-    st.subheader("Add documents", anchor=False)
+    if heading:
+        st.subheader(heading, anchor=False)
     st.caption(
-        "PDF, DOCX, Markdown, and text files are accepted. Nothing uploads until you confirm."
+        "PDF, DOCX, Markdown, and text files are supported. Nothing is added until you confirm."
     )
     uploads = st.file_uploader(
         "Choose documents",
         type=SUPPORTED_FILE_TYPES,
         accept_multiple_files=True,
-        help=f"Each file can be up to {_format_bytes(settings.upload_max_bytes)}.",
+        help=f"Each file can be up to {format_bytes(settings.upload_max_bytes)}.",
+        key=f"{key_prefix}-files",
     )
     add_clicked = st.button(
         "Add to library",
         type="primary",
         width="stretch",
         disabled=not uploads,
+        key=f"{key_prefix}-add",
     )
     if not add_clicked:
         return
@@ -407,10 +274,10 @@ def _render_upload(client: UiClient, settings: Settings) -> None:
     accepted = 0
     duplicates = 0
     failures: list[str] = []
-    progress = st.progress(0.0, text="Preparing uploads…")
+    progress = st.progress(0.0, text="Preparing your documents…")
     for index, uploaded in enumerate(uploads, start=1):
         if uploaded.size > settings.upload_max_bytes:
-            failures.append(f"{uploaded.name}: file exceeds the configured size limit")
+            failures.append(f"{uploaded.name}: this file is larger than the allowed limit")
             progress.progress(index / len(uploads), text=f"Checked {index} of {len(uploads)}")
             continue
         try:
@@ -424,37 +291,442 @@ def _render_upload(client: UiClient, settings: Settings) -> None:
         else:
             accepted += 1
             duplicates += int(receipt.duplicate)
-            _track_job(receipt.job, document_name=receipt.document.display_name, action="Adding")
+            _track_job(receipt.job, document_name=receipt.document.display_name)
         progress.progress(index / len(uploads), text=f"Submitted {index} of {len(uploads)}")
 
     if accepted:
         noun = "document" if accepted == 1 else "documents"
-        duplicate_note = f" ({duplicates} already known)" if duplicates else ""
-        st.success(f"{accepted} {noun} accepted{duplicate_note}. Processing continues in the API.")
+        duplicate_note = f" {duplicates} were already in your library." if duplicates else ""
+        st.session_state["activity_notice"] = (
+            f"{accepted} {noun} accepted. Processing is saved and continues in the background."
+            f"{duplicate_note}"
+        )
+    st.session_state["activity_errors"] = failures
+    if accepted:
+        _request_section("Activity")
     for failure in failures:
         st.error(failure)
 
 
-def _render_library(
+def _render_onboarding(client: UiClient, settings: Settings) -> None:
+    st.markdown('<div class="section-kicker">Start here</div>', unsafe_allow_html=True)
+    st.header("Bring in something you already use", anchor=False)
+    st.write("A project brief, meeting notes, a handbook, or a research PDF is enough to begin.")
+    # This is a trusted static fragment; file names are rendered only through Streamlit widgets.
+    st.markdown(ONBOARDING_STEPS_HTML, unsafe_allow_html=True)
+    with st.container(border=True):
+        _render_upload(client, settings, key_prefix="onboarding")
+
+
+def _choose_conversation(
+    client: UiClient,
+    conversations: list[ConversationSummary],
+) -> str | None:
+    known_ids = [conversation.id for conversation in conversations]
+    selected = st.session_state.get("selected_conversation_id")
+    starting_new = bool(st.session_state.get("starting_new_conversation"))
+
+    if not conversations:
+        starting_new = True
+        selected = None
+        st.session_state["starting_new_conversation"] = True
+        st.session_state["selected_conversation_id"] = None
+    elif not starting_new and selected not in known_ids:
+        selected = conversations[0].id
+        st.session_state["selected_conversation_id"] = selected
+
+    new_column, previous_column = st.columns([1, 2], vertical_alignment="bottom")
+    with new_column:
+        if st.button("New conversation", width="stretch", type="primary"):
+            st.session_state["selected_conversation_id"] = None
+            st.session_state["starting_new_conversation"] = True
+            st.session_state["confirm_delete_conversation"] = False
+            st.session_state["pending_client_turn_id"] = None
+            st.session_state["pending_turn_payload"] = None
+            st.session_state["turn_error"] = None
+            st.session_state.pop("conversation_picker", None)
+            st.rerun()
+    with previous_column:
+        if conversations:
+            selected_index = None
+            if not starting_new and selected in known_ids:
+                selected_index = known_ids.index(cast("str", selected))
+            picked = st.selectbox(
+                "Previous conversations",
+                options=known_ids,
+                index=selected_index,
+                format_func=lambda item_id: next(
+                    item.title for item in conversations if item.id == item_id
+                ),
+                placeholder="Choose a saved conversation",
+                key="conversation_picker",
+            )
+            if picked is not None and (starting_new or picked != selected):
+                st.session_state["selected_conversation_id"] = picked
+                st.session_state["starting_new_conversation"] = False
+                st.session_state["confirm_delete_conversation"] = False
+                st.session_state["pending_client_turn_id"] = None
+                st.session_state["pending_turn_payload"] = None
+                st.session_state["turn_error"] = None
+                st.rerun()
+
+    selected_value = st.session_state.get("selected_conversation_id")
+    if not isinstance(selected_value, str) or st.session_state.get("starting_new_conversation"):
+        return None
+
+    selected_summary = next(
+        (conversation for conversation in conversations if conversation.id == selected_value),
+        None,
+    )
+    if selected_summary is None:
+        return None
+
+    detail_column, delete_column = st.columns([4, 1], vertical_alignment="center")
+    with detail_column:
+        st.caption(
+            f"Saved conversation · {selected_summary.turn_count} "
+            f"{'question' if selected_summary.turn_count == 1 else 'questions'}"
+        )
+    with delete_column:
+        if st.button("Delete…", width="stretch"):
+            st.session_state["confirm_delete_conversation"] = True
+
+    if st.session_state.get("confirm_delete_conversation"):
+        st.warning("Delete this conversation and its saved answers? Your documents stay intact.")
+        confirm, cancel = st.columns(2)
+        with confirm:
+            if st.button("Delete permanently", type="primary", width="stretch"):
+                try:
+                    client.delete_conversation(selected_summary.id)
+                except ApiClientError as exc:
+                    st.error(exc.message)
+                else:
+                    st.session_state["selected_conversation_id"] = None
+                    st.session_state["starting_new_conversation"] = True
+                    st.session_state["confirm_delete_conversation"] = False
+                    st.session_state.pop("conversation_picker", None)
+                    st.rerun()
+        with cancel:
+            if st.button("Keep conversation", width="stretch"):
+                st.session_state["confirm_delete_conversation"] = False
+                st.rerun()
+    return selected_summary.id
+
+
+def _render_sources(citations: list[Citation]) -> None:
+    if not citations:
+        return
+    source_word = "Source" if len(citations) == 1 else "Sources"
+    with st.expander(f"{source_word} · {len(citations)}"):
+        for index, citation in enumerate(citations):
+            metadata = [citation.document_name]
+            if citation.page_number is not None:
+                metadata.append(f"page {citation.page_number}")
+            if citation.section:
+                metadata.append(citation.section)
+            st.markdown(f"**{citation.label}**")
+            st.caption(" · ".join(metadata))
+            # Document-derived text uses Streamlit's escaped renderer.
+            st.write(citation.snippet)
+            if index < len(citations) - 1:
+                st.divider()
+
+
+def _render_turn(client: UiClient, turn: ConversationTurn) -> None:
+    with st.container(border=True):
+        st.caption("You asked")
+        st.write(turn.question)
+        if turn.status is ConversationTurnStatus.PENDING:
+            st.info("This answer is still being prepared.")
+            if st.button("Check or retry", key=f"retry-turn-{turn.id}"):
+                _retry_persisted_turn(client, turn)
+            return
+        if turn.status is ConversationTurnStatus.FAILED:
+            message = "This question was not completed."
+            if turn.retryable:
+                message += " You can try it again without rewriting it."
+            st.warning(message)
+            if turn.retryable and st.button("Try again", key=f"retry-turn-{turn.id}"):
+                _retry_persisted_turn(client, turn)
+            return
+        st.markdown("**From your library**")
+        if turn.answer:
+            st.write(turn.answer)
+        if turn.no_answer:
+            st.info(
+                "There was not enough support in the selected documents. "
+                "Try different wording or include more documents."
+            )
+        _render_sources(turn.citations)
+
+
+def _retry_persisted_turn(client: UiClient, turn: ConversationTurn) -> None:
+    request = ConversationTurnCreate(
+        client_turn_id=turn.client_turn_id,
+        message=turn.question,
+        top_k=turn.top_k,
+        document_ids=turn.document_ids,
+    )
+    try:
+        with st.spinner("Checking the saved request…"):
+            client.create_conversation_turn(turn.conversation_id, request)
+    except ApiClientError as exc:
+        st.session_state["turn_error"] = {
+            "message": exc.message,
+            "retryable": exc.retryable,
+            "request_id": exc.request_id,
+        }
+    else:
+        st.session_state["turn_error"] = None
+    st.rerun()
+
+
+def _suggest_question(text: str, *, key: str, draft_key: str) -> None:
+    if st.button(text, key=key, width="stretch"):
+        st.session_state[draft_key] = text
+        st.rerun()
+
+
+def _render_question_form(
     client: UiClient,
     settings: Settings,
-    documents: list[DocumentPublic],
-    documents_error: ApiClientError | None,
+    ready_documents: list[DocumentPublic],
+    conversation_id: str | None,
 ) -> None:
-    _render_upload(client, settings)
-    st.divider()
+    error_state = st.session_state.get("turn_error")
+    if isinstance(error_state, dict):
+        st.error(str(error_state.get("message", "The question could not be completed.")))
+        if bool(error_state.get("retryable")):
+            st.caption("Your exact question is still here. Choose Ask library to try again.")
+
+    st.subheader("Ask a question", anchor=False)
+    st.caption("Choose specific documents, or leave the selection empty to use everything ready.")
+    document_names = {document.id: document.display_name for document in ready_documents}
+    selected_document_ids = st.multiselect(
+        "Look in",
+        options=list(document_names),
+        format_func=lambda document_id: document_names[document_id],
+        placeholder="All ready documents",
+        help="Leave empty to search your entire ready library.",
+    )
+    top_k = min(settings.retrieval_top_k, settings.retrieval_max_top_k)
+    with st.expander("Search options"):
+        top_k = st.slider(
+            "Number of passages to consider",
+            min_value=1,
+            max_value=settings.retrieval_max_top_k,
+            value=top_k,
+            help="The default is usually best. Increase this only when answers miss context.",
+        )
+
+    draft_version = int(st.session_state["question_draft_version"])
+    draft_key = f"question_draft_{draft_version}"
+    st.caption("Not sure where to start?")
+    suggestions = st.columns(3)
+    with suggestions[0]:
+        _suggest_question(
+            "Summarize the main points",
+            key=f"suggest-summary-{draft_version}",
+            draft_key=draft_key,
+        )
+    with suggestions[1]:
+        _suggest_question(
+            "What decisions were made?",
+            key=f"suggest-decisions-{draft_version}",
+            draft_key=draft_key,
+        )
+    with suggestions[2]:
+        _suggest_question(
+            "What should I follow up on?",
+            key=f"suggest-followup-{draft_version}",
+            draft_key=draft_key,
+        )
+
+    with st.form("library-question-form", clear_on_submit=False):
+        question = st.text_area(
+            "Your question",
+            key=draft_key,
+            placeholder="What do these documents say about…",
+            max_chars=settings.max_query_characters,
+            height=105,
+        )
+        submitted = st.form_submit_button("Ask library", type="primary", width="stretch")
+
+    if not submitted:
+        return
+    cleaned_question = question.strip()
+    if not cleaned_question:
+        st.warning("Write a question before asking your library.")
+        return
+
+    resolved_conversation_id = conversation_id
+    if resolved_conversation_id is None:
+        try:
+            conversation = client.create_conversation()
+        except ApiClientError as exc:
+            st.session_state["turn_error"] = {
+                "message": exc.message,
+                "retryable": exc.retryable,
+            }
+            st.rerun()
+        resolved_conversation_id = conversation.id
+        st.session_state["selected_conversation_id"] = resolved_conversation_id
+        st.session_state["starting_new_conversation"] = False
+        st.session_state.pop("conversation_picker", None)
+
+    request_payload = {
+        "message": cleaned_question,
+        "top_k": top_k,
+        "document_ids": selected_document_ids or None,
+    }
+    client_turn_id = st.session_state.get("pending_client_turn_id")
+    pending_payload = st.session_state.get("pending_turn_payload")
+    if not isinstance(client_turn_id, str) or pending_payload != request_payload:
+        client_turn_id = uuid4().hex
+        st.session_state["pending_client_turn_id"] = client_turn_id
+        st.session_state["pending_turn_payload"] = request_payload
+    request = ConversationTurnCreate(
+        client_turn_id=client_turn_id,
+        message=cleaned_question,
+        top_k=top_k,
+        document_ids=selected_document_ids or None,
+    )
+    try:
+        with st.spinner("Reading the most relevant passages…"):
+            client.create_conversation_turn(resolved_conversation_id, request)
+    except ApiClientError as exc:
+        st.session_state["turn_error"] = {
+            "message": exc.message,
+            "retryable": exc.retryable,
+            "request_id": exc.request_id,
+        }
+        if not exc.retryable:
+            st.session_state["pending_client_turn_id"] = None
+            st.session_state["pending_turn_payload"] = None
+        st.rerun()
+
+    st.session_state["turn_error"] = None
+    st.session_state["pending_client_turn_id"] = None
+    st.session_state["pending_turn_payload"] = None
+    st.session_state["question_draft_version"] = draft_version + 1
+    st.rerun()
+
+
+def _render_ask(client: UiClient, settings: Settings) -> None:
+    status, status_error = _safe_status(client)
+    documents, documents_error = _safe_documents(client)
+    if documents_error is not None:
+        st.error(documents_error.message)
+        st.info("Your saved work is untouched. Restore the knowledge service, then refresh.")
+        return
+    if status_error is not None or status is None:
+        st.error(status_error.message if status_error is not None else "Status is unavailable.")
+        st.info("Your saved work is untouched. Restore the knowledge service, then refresh.")
+        return
+    if not documents:
+        _render_onboarding(client, settings)
+        return
+    if not _providers_configured(status):
+        st.header("One setup step remains", anchor=False)
+        st.warning(
+            "Connect the document and answer providers on the server before asking questions."
+        )
+        if st.button("Open system details"):
+            _request_section("System")
+        return
+
+    ready_documents = [
+        document for document in documents if document.status is DocumentStatus.READY
+    ]
+    if not ready_documents:
+        st.header("Your documents are getting ready", anchor=False)
+        st.write("Processing continues even if you close this page.")
+        if st.button("View activity", type="primary"):
+            _request_section("Activity")
+        return
+
+    st.markdown('<div class="section-kicker">Ask</div>', unsafe_allow_html=True)
+    st.header("Ask your library", anchor=False)
+    st.caption("Saved conversations come back after a refresh, with their source passages intact.")
+
+    conversation_page, conversation_error = _safe_conversations(client)
+    if conversation_error is not None:
+        st.error(conversation_error.message)
+        return
+    conversations = conversation_page.items if conversation_page is not None else []
+    if conversation_page is not None and len(conversations) < conversation_page.total:
+        st.caption(
+            f"Showing the {len(conversations)} most recent of "
+            f"{conversation_page.total} saved conversations."
+        )
+    conversation_id = _choose_conversation(client, conversations)
+
+    if conversation_id is None:
+        st.subheader("A fresh conversation", anchor=False)
+        st.caption("Your first question will give this conversation a useful title.")
+        turns_page = None
+        turns_error = None
+    else:
+        turns_page, turns_error = _safe_turns(client, conversation_id)
+
+    _render_question_form(
+        client,
+        settings,
+        ready_documents,
+        conversation_id,
+    )
+    if turns_error is not None:
+        st.error(turns_error.message)
+    elif turns_page is not None:
+        if not turns_page.items:
+            st.caption("This conversation is ready for its first question.")
+        else:
+            st.subheader("Conversation", anchor=False)
+            if turns_page.total > len(turns_page.items):
+                st.caption(
+                    f"Showing the {len(turns_page.items)} most recent of "
+                    f"{turns_page.total} saved questions."
+                )
+            for turn in turns_page.items:
+                _render_turn(client, turn)
+
+
+def _run_document_action(
+    action_call: Callable[[str], JobRecord],
+    *,
+    document: DocumentPublic,
+) -> None:
+    try:
+        job = action_call(document.id)
+    except ApiClientError as exc:
+        st.error(exc.message)
+        return
+    _track_job(job, document_name=document.display_name)
+    st.session_state["activity_notice"] = (
+        f"{job_action_label(job.kind)} {document.display_name}. Progress is saved."
+    )
+    st.session_state["activity_errors"] = []
+    _request_section("Activity")
+
+
+def _render_documents(client: UiClient, settings: Settings) -> None:
+    st.markdown('<div class="section-kicker">Documents</div>', unsafe_allow_html=True)
+    st.header("Documents", anchor=False)
+    with st.container(border=True):
+        _render_upload(client, settings, key_prefix="documents", heading="Add documents")
+
+    documents, documents_error = _safe_documents(client)
     st.subheader("Your library", anchor=False)
     search = st.text_input(
-        "Search documents",
-        placeholder="Filename, extension, or status",
-        help="Search is local to the sanitized library records already returned by the API.",
+        "Find a document",
+        placeholder="Search by filename, type, or state",
+        help="Searches the bounded library records already returned by the service.",
     )
     if documents_error is not None:
         st.error(documents_error.message)
         return
     if not documents:
-        st.markdown("### Add your first document")
-        st.info("Choose one or more files above, then select Add to library.")
+        st.info("Your library is empty. Add a document above to begin.")
         return
 
     query = search.casefold().strip()
@@ -463,90 +735,165 @@ def _render_library(
         for document in documents
         if not query
         or query
-        in " ".join((document.display_name, document.extension, document.status.value)).casefold()
+        in " ".join(
+            (
+                document.display_name,
+                document.extension,
+                document_status_label(document.status),
+            )
+        ).casefold()
     ]
-    st.caption(f"Showing {len(filtered)} of {len(documents)} documents")
+    st.caption(f"{len(filtered)} of {len(documents)} documents")
     if not filtered:
         st.info("No documents match that search.")
         return
 
     for document in filtered:
-        status_label = document.status.value.replace("_", " ").title()
-        with st.expander(f"{document.display_name} · {status_label}"):
-            metrics = st.columns(3)
-            metrics[0].metric("Size", _format_bytes(document.size_bytes))
-            metrics[1].metric("Chunks", document.chunk_count)
-            metrics[2].metric("Version", document.active_version)
+        status_label = document_status_label(document.status)
+        with st.expander(f"{document.display_name} — {status_label}"):
             st.caption(
-                f"{document.content_type} · Added {document.created_at:%b %d, %Y} · "
-                f"Updated {document.updated_at:%b %d, %Y %H:%M UTC}"
+                f"{document.extension.removeprefix('.').upper()} · "
+                f"{format_bytes(document.size_bytes)} · "
+                f"Updated {document.updated_at:%b %d, %Y}"
             )
-            if document.error_code:
-                if document.status == DocumentStatus.DELETION_FAILED:
-                    st.warning(
-                        "Deletion is incomplete. Restore storage access, then retry deletion."
-                    )
+            if document.status is DocumentStatus.READY:
+                st.write(f"Ready across {document.chunk_count} searchable passages.")
+            elif document.status is DocumentStatus.DELETION_FAILED:
+                st.warning("Removal is incomplete. Restore storage access and retry below.")
+            elif document.status is DocumentStatus.FAILED:
+                st.warning("This document needs attention before it can be used in answers.")
+            else:
+                st.info("This document is still being prepared.")
+
+            with st.expander("Technical details"):
+                st.caption(
+                    f"Content type: {document.content_type} · "
+                    f"Version: {document.active_version} · "
+                    f"Passages: {document.chunk_count}"
+                )
+                if document.error_code:
+                    st.caption(f"Error code: {document.error_code}")
+
+            can_refresh = document.status in {DocumentStatus.READY, DocumentStatus.FAILED}
+            if st.button(
+                "Refresh document",
+                key=f"refresh-document-{document.id}",
+                disabled=not can_refresh,
+            ):
+                _run_document_action(client.reindex_document, document=document)
+
+            st.markdown("**Remove document**")
+            st.caption(
+                "This removes the stored file, its search index, and saved answers that cite it."
+            )
+            confirmation = st.text_input(
+                f'Type "{document.display_name}" to confirm removal',
+                key=f"delete-confirm-{document.id}",
+            )
+            delete_label = (
+                f"Retry removal of {document.display_name}"
+                if document.status is DocumentStatus.DELETION_FAILED
+                else f"Remove {document.display_name} permanently"
+            )
+            if st.button(
+                delete_label,
+                key=f"delete-document-{document.id}",
+                disabled=confirmation != document.display_name,
+            ):
+                _run_document_action(client.delete_document, document=document)
+
+
+def _activity_document_name(
+    job: JobRecord,
+    document_names: dict[str, str],
+    tracked_jobs: dict[str, dict[str, object]],
+) -> str:
+    tracked = tracked_jobs.get(job.id, {})
+    tracked_name = tracked.get("document_name")
+    if isinstance(tracked_name, str):
+        return tracked_name
+    return document_names.get(job.document_id, f"Document {job.document_id[:8]}")
+
+
+def _render_activity_rows(
+    client: UiClient,
+    documents: list[DocumentPublic],
+) -> bool:
+    jobs_page, jobs_error = _safe_jobs(client)
+    if jobs_error is not None:
+        st.error(jobs_error.message)
+        st.info("Activity remains stored by the service. Refresh when the connection returns.")
+        return False
+    if jobs_page is None or not jobs_page.items:
+        st.info("No processing activity yet. Add a document to see progress here.")
+        return False
+
+    document_names = {document.id: document.display_name for document in documents}
+    tracked_jobs = cast("dict[str, dict[str, object]]", st.session_state["tracked_jobs"])
+    active = [job for job in jobs_page.items if job.status not in TERMINAL_JOB_STATUSES]
+    failed = [job for job in jobs_page.items if job.status is JobStatus.FAILED]
+    completed = [job for job in jobs_page.items if job.status is JobStatus.SUCCEEDED]
+
+    def render_jobs(heading: str, jobs: list[JobRecord]) -> None:
+        if not jobs:
+            return
+        st.subheader(heading, anchor=False)
+        for job in jobs:
+            document_name = _activity_document_name(job, document_names, tracked_jobs)
+            action = job_action_label(job.kind)
+            with st.container(border=True):
+                label_column, state_column = st.columns([3, 1], vertical_alignment="center")
+                with label_column:
+                    st.markdown(f"**{action} {_escape_markdown(document_name)}**")
+                    st.caption(f"Started {job.created_at:%b %d at %H:%M UTC}")
+                with state_column:
+                    st.write(job_status_label(job.status, job.stage))
+                if job.status not in TERMINAL_JOB_STATUSES:
+                    st.progress(job.progress, text=job_status_label(job.status, job.stage))
+                    st.caption("You can close this page; progress is saved by the service.")
+                elif job.status is JobStatus.FAILED:
+                    st.warning("This work needs attention. Open Documents to inspect and retry.")
+                    if job.error_code:
+                        with st.expander("Error details"):
+                            st.caption(f"Error code: {job.error_code}")
                 else:
-                    st.warning(
-                        "The last processing attempt failed. You can reindex after checking "
-                        "provider and worker status."
-                    )
-                st.caption(f"Error code: {document.error_code}")
+                    st.success("Complete")
 
-            action_column, confirmation_column = st.columns([1, 2])
-            with action_column:
-                can_reindex = document.status in {
-                    DocumentStatus.READY,
-                    DocumentStatus.FAILED,
-                }
-                if st.button(
-                    "Reindex",
-                    key=f"reindex-{document.id}",
-                    width="stretch",
-                    disabled=not can_reindex,
-                ):
-                    _run_document_action(
-                        client.reindex_document,
-                        document=document,
-                        action="Reindexing",
-                    )
-            with confirmation_column:
-                confirmation = st.text_input(
-                    f'Type "{document.display_name}" to confirm deletion',
-                    key=f"delete-confirm-{document.id}",
-                    help="Deletion is asynchronous and removes indexed chunks after readback.",
-                )
-                delete_label = (
-                    "Retry deletion"
-                    if document.status == DocumentStatus.DELETION_FAILED
-                    else f"Delete {document.display_name}"
-                )
-                if st.button(
-                    delete_label,
-                    key=f"delete-{document.id}",
-                    width="stretch",
-                    disabled=confirmation != document.display_name,
-                ):
-                    _run_document_action(
-                        client.delete_document,
-                        document=document,
-                        action="Deleting",
-                    )
+    if active:
+        render_jobs("In progress", active)
+    render_jobs("Needs attention", failed)
+    render_jobs("Completed", completed)
+    if (failed or completed) and not active:
+        st.caption("Showing the most recent saved activity.")
+    return bool(active)
 
 
-def _run_document_action(
-    action_call: Callable[[str], JobRecord],
-    *,
-    document: DocumentPublic,
-    action: str,
-) -> None:
-    try:
-        job = action_call(document.id)
-    except ApiClientError as exc:
-        st.error(exc.message)
-        return
-    _track_job(job, document_name=document.display_name, action=action)
-    st.success(f"{action} was queued. Progress is stored by the API.")
+def _render_activity(client: UiClient) -> None:
+    st.markdown('<div class="section-kicker">Activity</div>', unsafe_allow_html=True)
+    heading, refresh = st.columns([4, 1], vertical_alignment="center")
+    with heading:
+        st.header("Recent activity", anchor=False)
+        st.caption("Processing is stored by the service and comes back after a refresh.")
+    with refresh:
+        if st.button("Refresh", width="stretch"):
+            st.rerun()
+
+    notice = st.session_state.pop("activity_notice", None)
+    if isinstance(notice, str) and notice:
+        st.success(notice)
+    errors = st.session_state.pop("activity_errors", [])
+    if isinstance(errors, list):
+        for error in errors:
+            if isinstance(error, str):
+                st.warning(error)
+
+    documents, documents_error = _safe_documents(client)
+    if documents_error is not None:
+        documents = []
+
+    has_active = _render_activity_rows(client, documents)
+    if has_active:
+        st.caption("Choose Refresh to check the latest progress.")
 
 
 def _health_label(check_call: Callable[[], HealthCheck]) -> str:
@@ -556,90 +903,88 @@ def _health_label(check_call: Callable[[], HealthCheck]) -> str:
         return "unavailable"
 
 
-def _render_settings_status(
-    client: UiClient,
-    status: SystemStatus | None,
-    status_error: ApiClientError | None,
-) -> None:
+def _render_system(client: UiClient) -> None:
+    st.markdown('<div class="section-kicker">System</div>', unsafe_allow_html=True)
     heading, refresh = st.columns([4, 1], vertical_alignment="center")
     with heading:
-        st.subheader("Settings & Status", anchor=False)
-        st.caption("Operational metadata is sanitized; credentials are never rendered in the UI.")
+        st.header("System details", anchor=False)
+        st.caption("For setup and troubleshooting. Credentials never appear in this workspace.")
     with refresh:
-        if st.button("Refresh status", width="stretch"):
+        if st.button("Refresh", key="refresh-system", width="stretch"):
             st.rerun()
 
     live_state = _health_label(client.health_live)
     ready_state = _health_label(client.health_ready)
-    health_columns = st.columns(2)
-    health_columns[0].metric("API process", live_state.title())
-    health_columns[1].metric("API readiness", ready_state.title())
+    process_column, readiness_column = st.columns(2)
+    with process_column, st.container(border=True):
+        st.caption("Knowledge service")
+        st.write(live_state.capitalize())
+    with readiness_column, st.container(border=True):
+        st.caption("Document search")
+        st.write(ready_state.capitalize())
 
+    status, status_error = _safe_status(client)
     if status_error is not None:
         st.error(status_error.message)
         return
     if status is None:
-        st.warning("Status is not currently available.")
+        st.warning("System details are not available right now.")
         return
 
     if not _providers_configured(status):
-        _render_provider_blocker()
+        st.warning(
+            "Provider setup is incomplete. Configure credentials on the server, then refresh."
+        )
 
-    counts = st.columns(4)
-    counts[0].metric("Documents", status.document_count)
-    counts[1].metric("Ready", status.ready_document_count)
-    counts[2].metric("Chunks", status.chunk_count)
-    counts[3].metric("Queued jobs", status.queued_job_count)
-
-    st.markdown("#### Models")
-    model_columns = st.columns(2)
-    with model_columns[0]:
-        st.write(f"Embedding: {status.embedding_provider} / {status.embedding_model}")
-        st.caption(f"{status.embedding_dimensions} dimensions")
-    with model_columns[1]:
+    st.markdown("### Library overview")
+    st.write(
+        f"{status.document_count} documents · {status.ready_document_count} ready · "
+        f"{status.queued_job_count} waiting"
+    )
+    with st.expander("Models and storage"):
+        st.write(f"Document matching: {status.embedding_provider} / {status.embedding_model}")
         st.write(f"Answers: {status.chat_provider} / {status.chat_model}")
-        st.caption(f"Collection: {status.collection}")
-
-    st.markdown("#### Dependencies")
-    dependency_rows = [
-        {"Dependency": dependency.name, "State": dependency.status}
-        for dependency in status.dependencies
-    ]
-    st.dataframe(dependency_rows, hide_index=True, width="stretch")
+        st.caption(
+            f"{status.embedding_dimensions} dimensions · Collection {status.collection} · "
+            f"{status.chunk_count} passages"
+        )
+    with st.expander("Dependency checks"):
+        for dependency in status.dependencies:
+            st.write(f"{dependency.name.replace('_', ' ').title()}: {dependency.status}")
+            if dependency.detail:
+                st.caption(dependency.detail)
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="Personal Knowledge Studio",
-        page_icon="📚",
+        page_title="Personal Library",
+        page_icon=":material/library_books:",
         layout="wide",
         initial_sidebar_state="collapsed",
     )
-    # This block contains trusted static CSS only. Document-derived content never enters it.
     st.markdown(STATIC_STYLES, unsafe_allow_html=True)
     _initialize_state()
+    _apply_requested_section()
 
     try:
         settings = _resolve_settings()
         client = _resolve_client()
     except Exception:
-        st.title("Personal Knowledge Studio")
-        st.error("Server-side configuration is incomplete, so the UI cannot connect safely.")
-        st.info("Configure the API URL and server-side bearer token, then restart Streamlit.")
+        st.markdown(HEADER_HTML, unsafe_allow_html=True)
+        st.error("The library cannot connect because server-side setup is incomplete.")
+        st.info("Configure the service URL and access token, then restart this workspace.")
         st.stop()
 
-    status, status_error = _safe_status(client)
-    documents, documents_error = _safe_documents(client)
-    _render_header(status, status_error)
-    _render_job_tracker(client, settings.ui_poll_seconds)
-
-    chat_tab, library_tab, settings_tab = st.tabs(["Chat", "Library", "Settings & Status"])
-    with chat_tab:
-        _render_chat(client, settings, status, documents, documents_error)
-    with library_tab:
-        _render_library(client, settings, documents, documents_error)
-    with settings_tab:
-        _render_settings_status(client, status, status_error)
+    _render_header()
+    section = _render_navigation()
+    if section == "Ask":
+        _render_ask(client, settings)
+    elif section == "Documents":
+        _render_documents(client, settings)
+    elif section == "Activity":
+        _render_activity(client)
+    else:
+        _render_system(client)
 
 
 main()

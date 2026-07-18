@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,11 +15,16 @@ from pydantic import SecretStr
 import personal_rag.api.app as app_module
 from personal_rag.api.app import create_app
 from personal_rag.config import Settings
-from personal_rag.errors import ProviderError
+from personal_rag.errors import ProviderError, RagError
 from personal_rag.models import (
+    ChatHistoryMessage,
     ChatRequest,
     ChatResponse,
     Citation,
+    ConversationSummary,
+    ConversationTurn,
+    ConversationTurnReservation,
+    ConversationTurnStatus,
     DocumentPublic,
     DocumentRecord,
     DocumentStatus,
@@ -33,6 +40,11 @@ class FakeRepository:
     def __init__(self) -> None:
         self.documents: dict[str, DocumentRecord] = {}
         self.jobs: dict[str, JobRecord] = {}
+        self.conversations: dict[str, ConversationSummary] = {}
+        self.turns: dict[str, ConversationTurn] = {}
+        self.turn_fingerprints: dict[str, str] = {}
+        self.turn_expiries: dict[str, datetime] = {}
+        self.turn_tokens: dict[str, str] = {}
 
     def get_statistics(self) -> dict[str, int]:
         active = [
@@ -97,6 +109,307 @@ class FakeRepository:
     def get_job(self, job_id: str) -> JobRecord | None:
         return self.jobs.get(job_id)
 
+    def list_jobs(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        status: JobStatus | None = None,
+        document_id: str | None = None,
+    ) -> list[JobRecord]:
+        items = list(reversed(self.jobs.values()))
+        if status is not None:
+            items = [item for item in items if item.status is status]
+        if document_id is not None:
+            items = [item for item in items if item.document_id == document_id]
+        return items[offset : offset + limit]
+
+    def count_jobs(
+        self,
+        *,
+        status: JobStatus | None = None,
+        document_id: str | None = None,
+    ) -> int:
+        return len(
+            self.list_jobs(
+                limit=10_000,
+                offset=0,
+                status=status,
+                document_id=document_id,
+            )
+        )
+
+    def create_conversation(self, title: str | None = None) -> ConversationSummary:
+        now = datetime.now(UTC)
+        conversation = ConversationSummary(
+            id=uuid4().hex,
+            title=title or "New conversation",
+            turn_count=0,
+            created_at=now,
+            updated_at=now,
+        )
+        self.conversations[conversation.id] = conversation
+        return conversation
+
+    def get_conversation(self, conversation_id: str) -> ConversationSummary | None:
+        return self.conversations.get(conversation_id)
+
+    def list_conversations(self, *, limit: int, offset: int) -> list[ConversationSummary]:
+        items = sorted(
+            self.conversations.values(),
+            key=lambda item: (item.updated_at, item.id),
+            reverse=True,
+        )
+        return items[offset : offset + limit]
+
+    def count_conversations(self) -> int:
+        return len(self.conversations)
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        conversation = self.conversations.pop(conversation_id, None)
+        if conversation is None:
+            return False
+        for turn_id in [
+            turn.id for turn in self.turns.values() if turn.conversation_id == conversation_id
+        ]:
+            self.turns.pop(turn_id, None)
+            self.turn_fingerprints.pop(turn_id, None)
+            self.turn_expiries.pop(turn_id, None)
+            self.turn_tokens.pop(turn_id, None)
+        return True
+
+    def reserve_conversation_turn(
+        self,
+        conversation_id: str,
+        *,
+        client_turn_id: str,
+        question: str,
+        top_k: int | None,
+        document_ids: list[str] | None,
+        request_fingerprint: str,
+        reservation_seconds: int = 120,
+    ) -> ConversationTurnReservation:
+        if conversation_id not in self.conversations:
+            raise RagError(
+                "conversation_not_found",
+                "The requested conversation does not exist.",
+                status_code=404,
+            )
+        existing = next(
+            (
+                turn
+                for turn in self.turns.values()
+                if turn.conversation_id == conversation_id and turn.client_turn_id == client_turn_id
+            ),
+            None,
+        )
+        now = datetime.now(UTC)
+        if existing is not None:
+            if self.turn_fingerprints[existing.id] != request_fingerprint:
+                raise RagError(
+                    "idempotency_conflict",
+                    "This client turn identifier was already used for a different question.",
+                    status_code=409,
+                )
+            if existing.status is ConversationTurnStatus.COMPLETED or (
+                existing.status is ConversationTurnStatus.FAILED and not existing.retryable
+            ):
+                return ConversationTurnReservation(
+                    turn=existing,
+                    created=False,
+                    cached_turn=existing,
+                )
+            if existing.status is ConversationTurnStatus.FAILED and existing.retryable:
+                reservation_token = uuid4().hex
+                recovered = existing.model_copy(
+                    update={
+                        "status": ConversationTurnStatus.PENDING,
+                        "error_code": None,
+                        "retryable": False,
+                        "updated_at": now,
+                    }
+                )
+                self.turns[existing.id] = recovered
+                self.turn_expiries[existing.id] = now + timedelta(seconds=reservation_seconds)
+                self.turn_tokens[existing.id] = reservation_token
+                return ConversationTurnReservation(
+                    turn=recovered,
+                    created=True,
+                    reservation_token=reservation_token,
+                )
+            if self.turn_expiries[existing.id] > now:
+                raise RagError(
+                    "conversation_turn_in_progress",
+                    "This question is already being answered.",
+                    status_code=409,
+                    retryable=True,
+                )
+            reservation_token = uuid4().hex
+            recovered = existing.model_copy(update={"updated_at": now})
+            self.turns[existing.id] = recovered
+            self.turn_expiries[existing.id] = now + timedelta(seconds=reservation_seconds)
+            self.turn_tokens[existing.id] = reservation_token
+            return ConversationTurnReservation(
+                turn=recovered,
+                created=True,
+                reservation_token=reservation_token,
+            )
+
+        turn = ConversationTurn(
+            id=uuid4().hex,
+            conversation_id=conversation_id,
+            client_turn_id=client_turn_id,
+            status=ConversationTurnStatus.PENDING,
+            question=question,
+            top_k=top_k,
+            document_ids=document_ids,
+            created_at=now,
+            updated_at=now,
+        )
+        self.turns[turn.id] = turn
+        self.turn_fingerprints[turn.id] = request_fingerprint
+        self.turn_expiries[turn.id] = now + timedelta(seconds=reservation_seconds)
+        reservation_token = uuid4().hex
+        self.turn_tokens[turn.id] = reservation_token
+        return ConversationTurnReservation(
+            turn=turn,
+            created=True,
+            reservation_token=reservation_token,
+        )
+
+    def renew_conversation_turn_reservation(
+        self,
+        turn_id: str,
+        *,
+        reservation_token: str,
+        reservation_seconds: int = 120,
+    ) -> bool:
+        turn = self.turns[turn_id]
+        if (
+            turn.status is not ConversationTurnStatus.PENDING
+            or self.turn_tokens.get(turn_id) != reservation_token
+        ):
+            return False
+        self.turn_expiries[turn_id] = datetime.now(UTC) + timedelta(seconds=reservation_seconds)
+        return True
+
+    def complete_conversation_turn(
+        self,
+        turn_id: str,
+        *,
+        reservation_token: str,
+        answer: str,
+        citations: list[Citation],
+        no_answer: bool,
+        request_id: str | None,
+    ) -> ConversationTurn:
+        existing = self.turns[turn_id]
+        if existing.status is ConversationTurnStatus.COMPLETED:
+            return existing
+        if self.turn_tokens.get(turn_id) != reservation_token:
+            raise RagError(
+                "conversation_turn_lease_lost",
+                "This question is being completed by a newer request.",
+                status_code=409,
+                retryable=True,
+            )
+        now = datetime.now(UTC)
+        turn = existing.model_copy(
+            update={
+                "status": ConversationTurnStatus.COMPLETED,
+                "answer": answer,
+                "citations": citations,
+                "no_answer": no_answer,
+                "request_id": request_id,
+                "updated_at": now,
+            }
+        )
+        self.turns[turn_id] = turn
+        self.turn_tokens.pop(turn_id, None)
+        conversation = self.conversations[turn.conversation_id]
+        title = conversation.title
+        if conversation.turn_count == 0 and title == "New conversation":
+            title = turn.question if len(turn.question) <= 72 else f"{turn.question[:71]}…"
+        self.conversations[turn.conversation_id] = conversation.model_copy(
+            update={
+                "title": title,
+                "turn_count": conversation.turn_count + 1,
+                "updated_at": now,
+            }
+        )
+        return turn
+
+    def fail_conversation_turn(
+        self,
+        turn_id: str,
+        *,
+        reservation_token: str,
+        error_code: str,
+        retryable: bool,
+    ) -> ConversationTurn:
+        existing = self.turns[turn_id]
+        if (
+            existing.status is not ConversationTurnStatus.PENDING
+            or self.turn_tokens.get(turn_id) != reservation_token
+        ):
+            return existing
+        turn = existing.model_copy(
+            update={
+                "status": ConversationTurnStatus.FAILED,
+                "error_code": error_code,
+                "retryable": retryable,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self.turns[turn_id] = turn
+        self.turn_tokens.pop(turn_id, None)
+        return turn
+
+    def conversation_history(self, conversation_id: str, *, limit: int) -> list[ChatHistoryMessage]:
+        completed = [
+            turn
+            for turn in self.turns.values()
+            if turn.conversation_id == conversation_id
+            and turn.status is ConversationTurnStatus.COMPLETED
+        ]
+        messages = [
+            message
+            for turn in completed
+            for message in (
+                ChatHistoryMessage(role="user", content=turn.question),
+                ChatHistoryMessage(role="assistant", content=turn.answer or ""),
+            )
+        ]
+        return messages[-limit:] if limit else []
+
+    def list_conversation_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        offset: int,
+        include_incomplete: bool = False,
+    ) -> list[ConversationTurn]:
+        items = [
+            turn
+            for turn in self.turns.values()
+            if turn.conversation_id == conversation_id
+            and (include_incomplete or turn.status is ConversationTurnStatus.COMPLETED)
+        ]
+        return items[offset : offset + limit]
+
+    def count_conversation_turns(
+        self, conversation_id: str, *, include_incomplete: bool = False
+    ) -> int:
+        return len(
+            self.list_conversation_turns(
+                conversation_id,
+                limit=10_000,
+                offset=0,
+                include_incomplete=include_incomplete,
+            )
+        )
+
     def request_reindex(self, document_id: str) -> JobRecord | None:
         return self._lifecycle_job(document_id, JobKind.REINDEX)
 
@@ -132,7 +445,13 @@ class FakeVectorStore:
 
 
 class FakeRagService:
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.requests: list[ChatRequest] = []
+
     def chat(self, request: ChatRequest) -> ChatResponse:
+        self.call_count += 1
+        self.requests.append(request)
         return ChatResponse(
             answer="The launch key was cobalt blue [S1].",
             citations=[
@@ -255,8 +574,10 @@ def test_sanitized_status_explains_vector_inventory_divergence(
 def test_data_routes_require_valid_bearer_token(client: TestClient) -> None:
     missing = client.get("/api/v1/documents")
     wrong = client.get("/api/v1/documents", headers={"Authorization": "Bearer definitely-wrong"})
+    conversation = client.get("/api/v1/conversations")
     assert missing.status_code == 401
     assert wrong.status_code == 401
+    assert conversation.status_code == 401
     assert missing.json()["error"]["code"] == "unauthorized"
     assert missing.headers["WWW-Authenticate"] == "Bearer"
 
@@ -333,6 +654,236 @@ def test_document_list_and_job_readback(client: TestClient, auth_headers: dict[s
     assert listed.json()["total"] == 1
     assert job.status_code == 200
     assert job.json()["document_id"] == uploaded["document"]["id"]
+
+
+def test_recent_jobs_are_paginated_and_filterable(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    first = client.post(
+        "/api/v1/documents",
+        headers=auth_headers,
+        files={"file": ("first.txt", b"first", "text/plain")},
+    ).json()
+    client.post(
+        "/api/v1/documents",
+        headers=auth_headers,
+        files={"file": ("second.txt", b"second", "text/plain")},
+    )
+
+    page = client.get("/api/v1/jobs?limit=1&offset=0", headers=auth_headers)
+    filtered = client.get(
+        f"/api/v1/jobs?document_id={first['document']['id']}",
+        headers=auth_headers,
+    )
+
+    assert page.status_code == 200
+    assert page.json()["total"] == 2
+    assert len(page.json()["items"]) == 1
+    assert filtered.json()["total"] == 1
+    assert filtered.json()["items"][0]["document_id"] == first["document"]["id"]
+
+
+def test_conversation_create_list_get_and_hard_delete(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    created = client.post(
+        "/api/v1/conversations",
+        headers=auth_headers,
+        json={"title": "Atlas notes"},
+    )
+    conversation_id = created.json()["id"]
+    listed = client.get("/api/v1/conversations", headers=auth_headers)
+    fetched = client.get(f"/api/v1/conversations/{conversation_id}", headers=auth_headers)
+    deleted = client.delete(f"/api/v1/conversations/{conversation_id}", headers=auth_headers)
+    missing = client.get(f"/api/v1/conversations/{conversation_id}", headers=auth_headers)
+
+    assert created.status_code == 201
+    assert created.json()["title"] == "Atlas notes"
+    assert listed.json()["total"] == 1
+    assert fetched.json() == created.json()
+    assert deleted.status_code == 204
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "conversation_not_found"
+
+
+def test_completed_turn_is_cached_and_persisted_with_authoritative_citations(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    conversation = client.post("/api/v1/conversations", headers=auth_headers, json={}).json()
+    body = {
+        "client_turn_id": "client-turn-001",
+        "message": "What color was the launch key?",
+        "top_k": 4,
+        "document_ids": ["doc-1"],
+    }
+
+    first = client.post(
+        f"/api/v1/conversations/{conversation['id']}/turns",
+        headers=auth_headers,
+        json=body,
+    )
+    second = client.post(
+        f"/api/v1/conversations/{conversation['id']}/turns",
+        headers=auth_headers,
+        json=body,
+    )
+    turns = client.get(
+        f"/api/v1/conversations/{conversation['id']}/turns",
+        headers=auth_headers,
+    )
+    service = client.app.state.container.rag_service
+
+    assert first.status_code == 200
+    assert first.json() == second.json()
+    assert first.json()["status"] == "completed"
+    assert first.json()["citations"][0]["chunk_id"] == "chunk-1"
+    assert first.json()["request_id"] == first.headers["X-Request-ID"]
+    assert turns.json()["total"] == 1
+    assert turns.json()["items"] == [first.json()]
+    assert service.call_count == 1
+
+    follow_up = client.post(
+        f"/api/v1/conversations/{conversation['id']}/turns",
+        headers=auth_headers,
+        json={
+            "client_turn_id": "client-turn-002",
+            "message": "What was it used for?",
+        },
+    )
+    assert follow_up.status_code == 200
+    assert [(item.role, item.content) for item in service.requests[-1].history] == [
+        ("user", "What color was the launch key?"),
+        ("assistant", "The launch key was cobalt blue [S1]."),
+    ]
+
+
+def test_active_turn_conflicts_and_expired_reservation_recovers(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    repository: FakeRepository,
+) -> None:
+    conversation = repository.create_conversation("Atlas")
+    body = {
+        "client_turn_id": "client-turn-001",
+        "message": "What is the key?",
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "document_ids": None,
+                "message": body["message"],
+                "top_k": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    reserved = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id=body["client_turn_id"],
+        question=body["message"],
+        top_k=None,
+        document_ids=None,
+        request_fingerprint=fingerprint,
+    )
+
+    active = client.post(
+        f"/api/v1/conversations/{conversation.id}/turns",
+        headers=auth_headers,
+        json=body,
+    )
+    assert active.status_code == 409
+    assert active.json()["error"]["code"] == "conversation_turn_in_progress"
+    assert active.json()["error"]["retryable"] is True
+
+    repository.turn_expiries[reserved.turn.id] = datetime.now(UTC) - timedelta(seconds=1)
+    recovered = client.post(
+        f"/api/v1/conversations/{conversation.id}/turns",
+        headers=auth_headers,
+        json=body,
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["id"] == reserved.turn.id
+    assert client.app.state.container.rag_service.call_count == 1
+
+
+def test_conversation_provider_failure_persists_only_safe_metadata(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    repository: FakeRepository,
+) -> None:
+    conversation = repository.create_conversation("Atlas")
+    client.app.state.container.rag_service = FailingRagService(retryable=True)
+
+    response = client.post(
+        f"/api/v1/conversations/{conversation.id}/turns",
+        headers=auth_headers,
+        json={
+            "client_turn_id": "client-turn-001",
+            "message": "What is the key?",
+        },
+    )
+    persisted = next(iter(repository.turns.values()))
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "vector_store_unavailable"
+    assert persisted.status is ConversationTurnStatus.FAILED
+    assert persisted.error_code == "vector_store_unavailable"
+    assert persisted.retryable is True
+    assert "private Qdrant response" not in response.text
+    refreshed = client.get(
+        f"/api/v1/conversations/{conversation.id}/turns",
+        headers=auth_headers,
+    )
+    assert refreshed.json()["total"] == 1
+    assert refreshed.json()["items"][0]["status"] == "failed"
+    assert refreshed.json()["items"][0]["question"] == "What is the key?"
+
+    client.app.state.container.rag_service = FakeRagService()
+    retried = client.post(
+        f"/api/v1/conversations/{conversation.id}/turns",
+        headers=auth_headers,
+        json={
+            "client_turn_id": "client-turn-001",
+            "message": "What is the key?",
+        },
+    )
+    assert retried.status_code == 200
+    assert retried.json()["id"] == persisted.id
+    assert retried.json()["status"] == "completed"
+
+
+def test_nonretryable_duplicate_returns_cached_failed_turn_without_provider_call(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    repository: FakeRepository,
+) -> None:
+    conversation = repository.create_conversation("Atlas")
+    body = {
+        "client_turn_id": "client-turn-001",
+        "message": "What is the key?",
+    }
+    client.app.state.container.rag_service = FailingRagService(retryable=False)
+    failed = client.post(
+        f"/api/v1/conversations/{conversation.id}/turns",
+        headers=auth_headers,
+        json=body,
+    )
+    replacement = FakeRagService()
+    client.app.state.container.rag_service = replacement
+
+    duplicate = client.post(
+        f"/api/v1/conversations/{conversation.id}/turns",
+        headers=auth_headers,
+        json=body,
+    )
+
+    assert failed.status_code == 503
+    assert duplicate.status_code == 200
+    assert duplicate.json()["status"] == "failed"
+    assert duplicate.json()["error_code"] == "vector_query_rejected"
+    assert duplicate.json()["retryable"] is False
+    assert replacement.call_count == 0
 
 
 def test_chat_returns_backend_citations(client: TestClient, auth_headers: dict[str, str]) -> None:

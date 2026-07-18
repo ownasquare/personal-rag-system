@@ -10,7 +10,14 @@ import pytest
 
 from personal_rag.database import SCHEMA_VERSION, Database
 from personal_rag.errors import RagError
-from personal_rag.models import DocumentStatus, JobKind, JobStage, JobStatus
+from personal_rag.models import (
+    Citation,
+    ConversationTurnStatus,
+    DocumentStatus,
+    JobKind,
+    JobStage,
+    JobStatus,
+)
 from personal_rag.repository import Repository
 
 
@@ -63,6 +70,20 @@ def create_upload(
     )
 
 
+def mark_document_ready(repository: Repository, document_id: str) -> None:
+    """Put a fixture document in authoritative retrieval-ready state."""
+
+    with repository.database.transaction(immediate=True) as connection:
+        connection.execute(
+            """
+            UPDATE documents
+            SET status = 'ready', active_version = 1, chunk_count = 1
+            WHERE id = ?
+            """,
+            (document_id,),
+        )
+
+
 def test_database_initializes_wal_foreign_keys_and_schema(tmp_path: Path) -> None:
     database = Database(tmp_path / "state.sqlite3")
     database.initialize()
@@ -82,7 +103,47 @@ def test_database_initializes_wal_foreign_keys_and_schema(tmp_path: Path) -> Non
     assert mode.lower() == "wal"
     assert foreign_keys == 1
     assert version == SCHEMA_VERSION
-    assert {"documents", "jobs", "meta", "upload_idempotency"} <= tables
+    assert {
+        "documents",
+        "jobs",
+        "meta",
+        "upload_idempotency",
+        "conversations",
+        "conversation_turns",
+        "turn_citations",
+    } <= tables
+
+
+def test_v1_database_migrates_conversations_without_changing_documents(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    repository = Repository(database)
+    receipt = create_upload(repository)
+
+    with database.connection() as connection:
+        connection.executescript(
+            """
+            DROP TABLE turn_citations;
+            DROP TABLE conversation_turns;
+            DROP TABLE conversations;
+            PRAGMA user_version = 1;
+            """
+        )
+
+    Database(database.path).initialize()
+
+    with database.connection() as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert version == 2
+    assert {"conversations", "conversation_turns", "turn_citations"} <= tables
+    assert Repository(database).get_document(receipt.document.id) is not None
+    assert Repository(database).get_job(receipt.job.id) is not None
 
 
 def test_repository_rejects_runtime_bound_absolute_storage_path(
@@ -485,6 +546,387 @@ def test_meta_and_worker_heartbeat_round_trip(repository: Repository, clock: Mut
     assert repository.get_meta("collection_schema") == "v1"
     assert repository.get_meta("worker_last_id") == "worker-a"
     assert repository.read_worker_heartbeat() == seen_at == clock.value
+
+
+def test_completed_conversation_turn_is_idempotent_and_round_trips_citations(
+    repository: Repository,
+) -> None:
+    receipt = create_upload(repository)
+    mark_document_ready(repository, receipt.document.id)
+    conversation = repository.create_conversation()
+    citation = Citation(
+        label="S1",
+        document_id=receipt.document.id,
+        chunk_id="chunk-1",
+        document_name="Notes.md",
+        page_number=2,
+        section="Launch",
+        snippet="The launch key is cobalt.",
+        score=0.91,
+    )
+    reservation = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="What is the launch key?",
+        top_k=5,
+        document_ids=["doc-1"],
+        request_fingerprint="a" * 64,
+    )
+    assert reservation.reservation_token is not None
+    completed = repository.complete_conversation_turn(
+        reservation.turn.id,
+        reservation_token=reservation.reservation_token,
+        answer="The launch key is cobalt [S1].",
+        citations=[citation],
+        no_answer=False,
+        request_id="request-1",
+    )
+    duplicate = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="What is the launch key?",
+        top_k=5,
+        document_ids=["doc-1"],
+        request_fingerprint="a" * 64,
+    )
+
+    assert reservation.created is True
+    assert completed.citations == [citation]
+    assert duplicate.created is False
+    assert duplicate.cached_turn == completed
+    assert repository.get_conversation(conversation.id).title == "What is the launch key?"  # type: ignore[union-attr]
+    assert repository.count_conversation_turns(conversation.id) == 1
+
+
+def test_conversation_reservation_conflicts_then_recovers_after_expiry(
+    repository: Repository, clock: MutableClock
+) -> None:
+    conversation = repository.create_conversation("Atlas")
+    first = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="What is the key?",
+        top_k=None,
+        document_ids=None,
+        request_fingerprint="b" * 64,
+        reservation_seconds=30,
+    )
+
+    with pytest.raises(RagError) as active:
+        repository.reserve_conversation_turn(
+            conversation.id,
+            client_turn_id="client-turn-001",
+            question="What is the key?",
+            top_k=None,
+            document_ids=None,
+            request_fingerprint="b" * 64,
+            reservation_seconds=30,
+        )
+    assert active.value.code == "conversation_turn_in_progress"
+    assert active.value.retryable is True
+
+    clock.advance(seconds=31)
+    recovered = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="What is the key?",
+        top_k=None,
+        document_ids=None,
+        request_fingerprint="b" * 64,
+        reservation_seconds=30,
+    )
+    assert recovered.created is True
+    assert recovered.turn.id == first.turn.id
+
+    failed = repository.fail_conversation_turn(
+        recovered.turn.id,
+        reservation_token=recovered.reservation_token or "missing-reservation-token",
+        error_code="provider_timeout",
+        retryable=True,
+    )
+    assert repository.count_conversation_turns(conversation.id) == 0
+    assert repository.count_conversation_turns(conversation.id, include_incomplete=True) == 1
+    assert (
+        repository.list_conversation_turns(conversation.id, include_incomplete=True)[0].status
+        is ConversationTurnStatus.FAILED
+    )
+    retry = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="What is the key?",
+        top_k=None,
+        document_ids=None,
+        request_fingerprint="b" * 64,
+        reservation_seconds=30,
+    )
+    assert failed.status is ConversationTurnStatus.FAILED
+    assert retry.created is True
+    assert retry.turn.status is ConversationTurnStatus.PENDING
+    assert retry.turn.id == first.turn.id
+
+
+def test_reservation_tokens_fence_stale_completion_and_failure(
+    repository: Repository, clock: MutableClock
+) -> None:
+    conversation = repository.create_conversation("Atlas")
+    first = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="What is the key?",
+        top_k=None,
+        document_ids=None,
+        request_fingerprint="f" * 64,
+        reservation_seconds=30,
+    )
+    assert first.reservation_token is not None
+
+    clock.advance(seconds=31)
+    recovered = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="What is the key?",
+        top_k=None,
+        document_ids=None,
+        request_fingerprint="f" * 64,
+        reservation_seconds=30,
+    )
+    assert recovered.reservation_token is not None
+    assert recovered.reservation_token != first.reservation_token
+    assert (
+        repository.renew_conversation_turn_reservation(
+            recovered.turn.id,
+            reservation_token=first.reservation_token,
+            reservation_seconds=30,
+        )
+        is False
+    )
+    assert (
+        repository.fail_conversation_turn(
+            recovered.turn.id,
+            reservation_token=first.reservation_token,
+            error_code="provider_timeout",
+            retryable=True,
+        ).status
+        is ConversationTurnStatus.PENDING
+    )
+    with pytest.raises(RagError, match="newer request") as stale_completion:
+        repository.complete_conversation_turn(
+            recovered.turn.id,
+            reservation_token=first.reservation_token,
+            answer="Stale answer.",
+            citations=[],
+            no_answer=True,
+            request_id="stale-request",
+        )
+    assert stale_completion.value.code == "conversation_turn_lease_lost"
+    assert repository.renew_conversation_turn_reservation(
+        recovered.turn.id,
+        reservation_token=recovered.reservation_token,
+        reservation_seconds=30,
+    )
+
+    completed = repository.complete_conversation_turn(
+        recovered.turn.id,
+        reservation_token=recovered.reservation_token,
+        answer="Current answer.",
+        citations=[],
+        no_answer=True,
+        request_id="current-request",
+    )
+    after_stale_failure = repository.fail_conversation_turn(
+        recovered.turn.id,
+        reservation_token=first.reservation_token,
+        error_code="provider_timeout",
+        retryable=True,
+    )
+    assert completed.status is ConversationTurnStatus.COMPLETED
+    assert after_stale_failure == completed
+
+
+def test_late_answer_cannot_persist_a_source_that_is_no_longer_ready(
+    repository: Repository,
+) -> None:
+    receipt = create_upload(repository)
+    mark_document_ready(repository, receipt.document.id)
+    conversation = repository.create_conversation("Atlas")
+    reservation = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="What is the key?",
+        top_k=5,
+        document_ids=[receipt.document.id],
+        request_fingerprint="9" * 64,
+    )
+    assert reservation.reservation_token is not None
+    repository.request_delete(receipt.document.id)
+
+    with pytest.raises(RagError, match="source changed") as changed:
+        repository.complete_conversation_turn(
+            reservation.turn.id,
+            reservation_token=reservation.reservation_token,
+            answer="Cobalt [S1].",
+            citations=[
+                Citation(
+                    label="S1",
+                    document_id=receipt.document.id,
+                    chunk_id="chunk-1",
+                    document_name=receipt.document.display_name,
+                    snippet="Cobalt.",
+                )
+            ],
+            no_answer=False,
+            request_id="late-request",
+        )
+    assert changed.value.code == "source_changed"
+    persisted = repository.get_conversation_turn(reservation.turn.id)
+    assert persisted is not None
+    assert persisted.status is ConversationTurnStatus.PENDING
+    assert persisted.answer is None
+    assert persisted.citations == []
+
+
+def test_conversation_history_is_bounded_and_hard_delete_cascades(
+    repository: Repository,
+) -> None:
+    conversation = repository.create_conversation("Atlas")
+    for index in range(3):
+        reservation = repository.reserve_conversation_turn(
+            conversation.id,
+            client_turn_id=f"client-turn-{index:03d}",
+            question=f"Question {index}",
+            top_k=None,
+            document_ids=None,
+            request_fingerprint=f"{index + 1:064x}",
+        )
+        repository.complete_conversation_turn(
+            reservation.turn.id,
+            reservation_token=reservation.reservation_token or "missing-reservation-token",
+            answer=f"Answer {index}",
+            citations=[],
+            no_answer=True,
+            request_id=f"request-{index}",
+        )
+
+    history = repository.conversation_history(conversation.id, limit=3)
+    assert [(message.role, message.content) for message in history] == [
+        ("user", "Question 2"),
+        ("assistant", "Answer 2"),
+    ]
+    assert repository.conversation_history(conversation.id, limit=1) == []
+    assert repository.delete_conversation(conversation.id) is True
+    assert repository.delete_conversation(conversation.id) is False
+    assert repository.get_conversation(conversation.id) is None
+
+
+def test_document_deletion_purges_whole_cited_turn(repository: Repository) -> None:
+    receipt = create_upload(repository)
+    mark_document_ready(repository, receipt.document.id)
+    conversation = repository.create_conversation("Atlas")
+    reservation = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="What is the key?",
+        top_k=5,
+        document_ids=[receipt.document.id],
+        request_fingerprint="c" * 64,
+    )
+    repository.complete_conversation_turn(
+        reservation.turn.id,
+        reservation_token=reservation.reservation_token or "missing-reservation-token",
+        answer="Cobalt [S1].",
+        citations=[
+            Citation(
+                label="S1",
+                document_id=receipt.document.id,
+                chunk_id="chunk-1",
+                document_name=receipt.document.display_name,
+                snippet="Cobalt.",
+            )
+        ],
+        no_answer=False,
+        request_id="request-1",
+    )
+
+    delete_job = repository.request_delete(receipt.document.id)
+    leased = repository.lease_next_job("worker-delete", kinds=[JobKind.DELETE])
+    assert leased is not None and leased.id == delete_job.id
+    repository.update_job_stage(
+        leased.id,
+        "worker-delete",
+        JobStage.DELETING,
+        progress=0.5,
+    )
+    repository.complete_job(leased.id, "worker-delete")
+
+    assert repository.count_conversation_turns(conversation.id) == 0
+    assert repository.get_conversation(conversation.id) is None
+
+
+def test_document_deletion_retitles_a_conversation_from_remaining_truth(
+    repository: Repository,
+) -> None:
+    receipt = create_upload(repository)
+    mark_document_ready(repository, receipt.document.id)
+    conversation = repository.create_conversation()
+    cited = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="Sensitive first question",
+        top_k=5,
+        document_ids=[receipt.document.id],
+        request_fingerprint="d" * 64,
+    )
+    repository.complete_conversation_turn(
+        cited.turn.id,
+        reservation_token=cited.reservation_token or "missing-reservation-token",
+        answer="Sensitive answer [S1].",
+        citations=[
+            Citation(
+                label="S1",
+                document_id=receipt.document.id,
+                chunk_id="chunk-1",
+                document_name=receipt.document.display_name,
+                snippet="Sensitive source text.",
+            )
+        ],
+        no_answer=False,
+        request_id="request-1",
+    )
+    remaining = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-002",
+        question="Remaining question",
+        top_k=5,
+        document_ids=None,
+        request_fingerprint="e" * 64,
+    )
+    repository.complete_conversation_turn(
+        remaining.turn.id,
+        reservation_token=remaining.reservation_token or "missing-reservation-token",
+        answer="No supported answer.",
+        citations=[],
+        no_answer=True,
+        request_id="request-2",
+    )
+
+    delete_job = repository.request_delete(receipt.document.id)
+    leased = repository.lease_next_job("worker-delete", kinds=[JobKind.DELETE])
+    assert leased is not None and leased.id == delete_job.id
+    repository.update_job_stage(
+        leased.id,
+        "worker-delete",
+        JobStage.DELETING,
+        progress=0.5,
+    )
+    repository.complete_job(leased.id, "worker-delete")
+
+    persisted = repository.get_conversation(conversation.id)
+    assert persisted is not None
+    assert persisted.title == "Remaining question"
+    assert persisted.turn_count == 1
+    assert [turn.question for turn in repository.list_conversation_turns(conversation.id)] == [
+        "Remaining question"
+    ]
 
 
 def test_database_rejects_a_newer_unknown_schema(tmp_path: Path) -> None:

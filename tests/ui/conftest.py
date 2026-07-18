@@ -1,9 +1,9 @@
-"""AppTest fixtures for the Streamlit presentation layer."""
+"""AppTest fixtures for the Phase 2 Personal Library presentation layer."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -11,14 +11,20 @@ from streamlit.testing.v1 import AppTest
 
 from personal_rag.config import Settings
 from personal_rag.models import (
-    ChatRequest,
     ChatResponse,
     Citation,
+    ConversationList,
+    ConversationSummary,
+    ConversationTurn,
+    ConversationTurnCreate,
+    ConversationTurnList,
+    ConversationTurnStatus,
     DependencyState,
     DocumentList,
     DocumentPublic,
     DocumentStatus,
     JobKind,
+    JobList,
     JobRecord,
     JobStage,
     JobStatus,
@@ -46,8 +52,8 @@ def make_document(
         extension=".md",
         size_bytes=2048,
         status=status,
-        active_version=1 if status == DocumentStatus.READY else 0,
-        chunk_count=4 if status == DocumentStatus.READY else 0,
+        active_version=1 if status is DocumentStatus.READY else 0,
+        chunk_count=4 if status is DocumentStatus.READY else 0,
         error_code=None,
         error_message=None,
         created_at=NOW,
@@ -63,7 +69,7 @@ def make_job(
     stage: JobStage = JobStage.QUEUED,
     kind: JobKind = JobKind.INGEST,
 ) -> JobRecord:
-    """Build a stable job contract for UI tests."""
+    """Build a stable durable job contract for UI tests."""
 
     return JobRecord(
         id=job_id,
@@ -71,12 +77,69 @@ def make_job(
         kind=kind,
         status=status,
         stage=stage,
-        progress=1.0 if status == JobStatus.SUCCEEDED else 0.0,
-        attempts=0,
+        progress=1.0 if status is JobStatus.SUCCEEDED else 0.0,
+        attempts=1,
         max_attempts=3,
         created_at=NOW,
         updated_at=NOW,
         finished_at=NOW if status in {JobStatus.SUCCEEDED, JobStatus.FAILED} else None,
+    )
+
+
+def make_conversation(
+    *,
+    conversation_id: str = "conversation-1",
+    title: str = "Atlas launch notes",
+    turn_count: int = 1,
+) -> ConversationSummary:
+    return ConversationSummary(
+        id=conversation_id,
+        title=title,
+        turn_count=turn_count,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def make_turn(
+    *,
+    turn_id: str = "turn-1",
+    conversation_id: str = "conversation-1",
+    client_turn_id: str = "client-turn-1",
+    status: ConversationTurnStatus = ConversationTurnStatus.COMPLETED,
+    question: str = "What is the launch key?",
+    answer: str | None = "The launch key is cobalt [S1].",
+    no_answer: bool = False,
+) -> ConversationTurn:
+    citations = []
+    if status is ConversationTurnStatus.COMPLETED and not no_answer:
+        citations = [
+            Citation(
+                label="S1",
+                document_id="doc-1",
+                chunk_id="doc-1:1",
+                document_name="field-notes.md",
+                section="Launch checklist",
+                snippet="The Atlas launch key is cobalt.",
+                score=0.92,
+            )
+        ]
+    return ConversationTurn(
+        id=turn_id,
+        conversation_id=conversation_id,
+        client_turn_id=client_turn_id,
+        status=status,
+        question=question,
+        answer=answer,
+        citations=citations,
+        no_answer=no_answer,
+        top_k=5,
+        document_ids=None,
+        request_id="request-1",
+        error_code="provider_unavailable" if status is ConversationTurnStatus.FAILED else None,
+        retryable=status is ConversationTurnStatus.FAILED,
+        created_at=NOW,
+        updated_at=NOW,
     )
 
 
@@ -107,38 +170,36 @@ class FakeRagClient:
     documents: list[DocumentPublic] = field(default_factory=list)
     system_status: SystemStatus = field(default_factory=ready_status)
     jobs: dict[str, JobRecord] = field(default_factory=dict)
+    conversations: list[ConversationSummary] = field(default_factory=list)
+    turns: dict[str, list[ConversationTurn]] = field(default_factory=dict)
     upload_calls: list[str] = field(default_factory=list)
+    upload_errors: dict[str, ApiClientError] = field(default_factory=dict)
     delete_calls: list[str] = field(default_factory=list)
     reindex_calls: list[str] = field(default_factory=list)
-    chat_calls: list[ChatRequest] = field(default_factory=list)
+    turn_calls: list[ConversationTurnCreate] = field(default_factory=list)
     chat_error: ApiClientError | None = None
-    chat_response: ChatResponse = field(
-        default_factory=lambda: ChatResponse(
-            answer="The launch key is cobalt [S1].",
-            citations=[
-                Citation(
-                    label="S1",
-                    document_id="doc-1",
-                    chunk_id="doc-1:1",
-                    document_name="field-notes.md",
-                    page_number=None,
-                    section="Launch checklist",
-                    snippet="The Atlas launch key is cobalt.",
-                    score=0.92,
-                )
-            ],
-            no_answer=False,
-            request_id="request-1",
-        )
-    )
+    status_error: ApiClientError | None = None
+    documents_error: ApiClientError | None = None
+    no_answer: bool = False
+    get_status_calls: int = 0
+    list_documents_calls: int = 0
+    list_jobs_calls: int = 0
+    list_conversations_calls: int = 0
+    health_live_calls: int = 0
+    health_ready_calls: int = 0
 
     def health_live(self) -> HealthCheck:
+        self.health_live_calls += 1
         return HealthCheck(status="alive")
 
     def health_ready(self) -> HealthCheck:
+        self.health_ready_calls += 1
         return HealthCheck(status="ready")
 
     def get_status(self) -> SystemStatus:
+        self.get_status_calls += 1
+        if self.status_error is not None:
+            raise self.status_error
         return self.system_status
 
     def list_documents(self, *, limit: int = 100, offset: int = 0) -> DocumentList:
@@ -146,6 +207,9 @@ class FakeRagClient:
         return DocumentList(items=items, total=len(self.documents), limit=limit, offset=offset)
 
     def list_all_documents(self, *, max_documents: int = 2000) -> list[DocumentPublic]:
+        self.list_documents_calls += 1
+        if self.documents_error is not None:
+            raise self.documents_error
         return self.documents[:max_documents]
 
     def get_document(self, document_id: str) -> DocumentPublic:
@@ -154,6 +218,8 @@ class FakeRagClient:
     def upload_document(self, filename: str, content: bytes, content_type: str) -> UploadReceipt:
         del content, content_type
         self.upload_calls.append(filename)
+        if filename in self.upload_errors:
+            raise self.upload_errors[filename]
         index = len(self.upload_calls)
         document = make_document(
             filename,
@@ -167,6 +233,28 @@ class FakeRagClient:
 
     def get_job(self, job_id: str) -> JobRecord:
         return self.jobs[job_id]
+
+    def list_jobs(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        status: JobStatus | None = None,
+        document_id: str | None = None,
+    ) -> JobList:
+        self.list_jobs_calls += 1
+        items = list(reversed(list(self.jobs.values())))
+        if status is not None:
+            items = [item for item in items if item.status is status]
+        if document_id is not None:
+            items = [item for item in items if item.document_id == document_id]
+        total = len(items)
+        return JobList(
+            items=items[offset : offset + limit],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
 
     def reindex_document(self, document_id: str) -> JobRecord:
         self.reindex_calls.append(document_id)
@@ -188,11 +276,125 @@ class FakeRagClient:
         self.jobs[job.id] = job
         return job
 
-    def chat(self, request: ChatRequest) -> ChatResponse:
-        self.chat_calls.append(request)
+    def create_conversation(self, title: str | None = None) -> ConversationSummary:
+        index = len(self.conversations) + 1
+        conversation = make_conversation(
+            conversation_id=f"conversation-{index}",
+            title=title or "New conversation",
+            turn_count=0,
+        )
+        self.conversations.insert(0, conversation)
+        self.turns[conversation.id] = []
+        return conversation
+
+    def list_conversations(self, *, limit: int = 50, offset: int = 0) -> ConversationList:
+        self.list_conversations_calls += 1
+        return ConversationList(
+            items=self.conversations[offset : offset + limit],
+            total=len(self.conversations),
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_conversation(self, conversation_id: str) -> ConversationSummary:
+        return next(item for item in self.conversations if item.id == conversation_id)
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        self.conversations = [item for item in self.conversations if item.id != conversation_id]
+        self.turns.pop(conversation_id, None)
+
+    def list_conversation_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> ConversationTurnList:
+        turns = self.turns.get(conversation_id, [])
+        return ConversationTurnList(
+            items=turns[offset : offset + limit],
+            total=len(turns),
+            limit=limit,
+            offset=offset,
+        )
+
+    def create_conversation_turn(
+        self,
+        conversation_id: str,
+        turn: ConversationTurnCreate,
+    ) -> ConversationTurn:
+        self.turn_calls.append(turn)
         if self.chat_error is not None:
             raise self.chat_error
-        return self.chat_response
+        existing = next(
+            (
+                item
+                for item in self.turns.get(conversation_id, [])
+                if item.client_turn_id == turn.client_turn_id
+            ),
+            None,
+        )
+        if existing is not None:
+            if (
+                existing.question != turn.message
+                or existing.top_k != turn.top_k
+                or existing.document_ids != turn.document_ids
+            ):
+                raise ApiClientError(
+                    code="idempotency_conflict",
+                    message="This saved request identifier belongs to different question details.",
+                    status_code=409,
+                    retryable=False,
+                )
+            if existing.status in {
+                ConversationTurnStatus.PENDING,
+                ConversationTurnStatus.FAILED,
+            }:
+                completed = make_turn(
+                    turn_id=existing.id,
+                    conversation_id=conversation_id,
+                    client_turn_id=turn.client_turn_id,
+                    question=turn.message,
+                ).model_copy(update={"top_k": turn.top_k, "document_ids": turn.document_ids})
+                conversation_turns = self.turns.get(conversation_id, [])
+                self.turns[conversation_id] = [
+                    completed if item.id == existing.id else item for item in conversation_turns
+                ]
+                return completed
+            return existing
+        index = sum(len(items) for items in self.turns.values()) + 1
+        created = make_turn(
+            turn_id=f"turn-{index}",
+            conversation_id=conversation_id,
+            client_turn_id=turn.client_turn_id,
+            question=turn.message,
+            answer=(
+                "I could not find enough support in the selected documents."
+                if self.no_answer
+                else "The launch key is cobalt [S1]."
+            ),
+            no_answer=self.no_answer,
+        ).model_copy(update={"top_k": turn.top_k, "document_ids": turn.document_ids})
+        self.turns.setdefault(conversation_id, []).append(created)
+        for position, conversation in enumerate(self.conversations):
+            if conversation.id != conversation_id:
+                continue
+            title = conversation.title
+            if conversation.turn_count == 0:
+                title = turn.message[:72]
+            self.conversations[position] = conversation.model_copy(
+                update={
+                    "title": title,
+                    "turn_count": conversation.turn_count + 1,
+                    "updated_at": NOW + timedelta(seconds=index),
+                }
+            )
+            break
+        return created
+
+    def chat(self, request: object) -> ChatResponse:
+        del request
+        raise AssertionError("The Phase 2 UI must use durable conversation turns")
 
     def close(self) -> None:
         return None

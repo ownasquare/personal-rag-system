@@ -23,8 +23,9 @@ The response header `X-Request-ID` carries the same correlation ID. Request and 
 are not logged.
 
 The API rejects request bodies above the configured upload limit before multipart parsing,
-including streaming requests without Content-Length. Chat history is capped by both schema and
-runtime configuration; the absolute schema ceiling is 100 messages. The configurable upload
+including streaming requests without Content-Length. Stateless chat history and reconstructed
+conversation history are capped by both schema and runtime configuration; the absolute schema
+ceiling is 100 messages. The configurable upload
 limit can be lowered from the shared 25 MiB UI/API ceiling, and the query limit can be lowered
 from the 4,000-character schema ceiling.
 
@@ -100,10 +101,56 @@ URL-safe characters.
 | `GET` | `/api/v1/documents/{document_id}` | One sanitized document record |
 | `POST` | `/api/v1/documents/{document_id}/reindex` | `202` durable reindex job |
 | `DELETE` | `/api/v1/documents/{document_id}` | `202` durable verified-deletion job |
+| `GET` | `/api/v1/jobs?limit=50&offset=0&status=running&document_id=...` | Paginated durable activity |
 | `GET` | `/api/v1/jobs/{job_id}` | Durable stage/progress/error readback |
 
 Deletion is idempotent. A document in `deleting` state is excluded from ordinary retrieval; it is
 not reported `deleted` until Qdrant and retained-file readback succeed.
+
+## Durable conversations
+
+The UI uses server-side conversation truth rather than browser-local chat history.
+
+| Method | Path | Result |
+|---|---|---|
+| `POST` | `/api/v1/conversations` | Create an empty saved conversation |
+| `GET` | `/api/v1/conversations?limit=50&offset=0` | Recency-ordered summaries |
+| `GET` | `/api/v1/conversations/{conversation_id}` | One summary and completed-turn count |
+| `DELETE` | `/api/v1/conversations/{conversation_id}` | `204`, hard-delete retained turn content |
+| `GET` | `/api/v1/conversations/{conversation_id}/turns` | Completed, pending, and failed turn truth |
+| `POST` | `/api/v1/conversations/{conversation_id}/turns` | Reserve, answer, and persist one turn |
+
+Create a turn with a stable client-generated ID:
+
+```json
+{
+  "client_turn_id": "a96ee96a24c24a8290bdc123e704a05f",
+  "message": "What was the Atlas launch key color?",
+  "top_k": 5,
+  "document_ids": null
+}
+```
+
+The API reserves `(conversation_id, client_turn_id)` before provider work. A completed duplicate
+returns the persisted result without a second provider call. An active duplicate returns a
+retryable `409`; an expired or retryable failed reservation can be reclaimed only with the same
+request fingerprint. Every live provider call renews an internal ownership token; completion and
+failure writes are fenced by that token so a stale attempt cannot overwrite a newer recovery.
+Conversation history is rebuilt exclusively from complete user/assistant pairs in completed
+turns.
+
+Each response is a `ConversationTurn` with `pending`, `completed`, or `failed` status, the original
+question and document scope, typed citations, and safe failure metadata. Provider exception text
+is never stored. The first completed question gives an untitled conversation a deterministic
+72-character title. Immediately before answer/citation commit, SQLite revalidates every cited
+document as retrieval-ready in the same write transaction. A source removed or reindexed while a
+provider call is in flight therefore produces a retryable `source_changed` response instead of
+re-persisting stale content.
+
+When verified source deletion completes, every whole conversation turn citing that document is
+deleted in the same SQLite transaction. Empty affected conversations are removed, and non-empty
+affected conversations are retitled from their first remaining completed question so a purged
+question cannot survive in the title. Offline backups remain separate retained copies.
 
 ## Chat
 
@@ -145,3 +192,6 @@ The response separates answer prose from authoritative citation records:
 
 `score` is retrieval relevance, not a calibrated probability. When sources do not support an
 answer, `no_answer` is true and citations are empty.
+
+`POST /api/v1/chat` remains a stateless compatibility endpoint. New first-party UI work should use
+conversation turns so idempotency, history, failures, citations, and refresh recovery are durable.

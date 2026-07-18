@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def utc_now() -> datetime:
@@ -115,6 +115,13 @@ class JobRecord(BaseModel):
     finished_at: datetime | None = None
 
 
+class JobList(BaseModel):
+    items: list[JobRecord]
+    total: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
+
+
 class UploadReceipt(BaseModel):
     document: DocumentPublic
     job: JobRecord
@@ -149,6 +156,118 @@ class Citation(BaseModel):
     section: str | None = None
     snippet: str
     score: float | None = None
+
+
+class ConversationTurnStatus(StrEnum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ConversationCreate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        if not normalized or "\x00" in normalized:
+            raise ValueError("title must contain visible text")
+        return normalized
+
+
+class ConversationSummary(BaseModel):
+    id: str
+    title: str
+    turn_count: int = Field(ge=0)
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConversationList(BaseModel):
+    items: list[ConversationSummary]
+    total: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
+
+
+class ConversationTurnCreate(BaseModel):
+    client_turn_id: str = Field(min_length=8, max_length=128)
+    message: str = Field(min_length=1, max_length=4000)
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    document_ids: list[str] | None = Field(default=None, max_length=100)
+
+    @field_validator("client_turn_id")
+    @classmethod
+    def validate_client_turn_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if (
+            len(normalized) < 8
+            or len(normalized) > 128
+            or any(ord(character) < 32 for character in normalized)
+        ):
+            raise ValueError("client_turn_id must contain 8 to 128 safe characters")
+        return normalized
+
+    @field_validator("message")
+    @classmethod
+    def normalize_message(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized or "\x00" in normalized:
+            raise ValueError("message must contain visible text")
+        return normalized
+
+    @field_validator("document_ids")
+    @classmethod
+    def validate_document_ids(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        normalized: list[str] = []
+        for value in values:
+            document_id = value.strip()
+            if (
+                not document_id
+                or len(document_id) > 128
+                or any(ord(character) < 32 for character in document_id)
+            ):
+                raise ValueError("document identifiers must contain 1 to 128 safe characters")
+            if document_id not in normalized:
+                normalized.append(document_id)
+        return normalized
+
+
+class ConversationTurn(BaseModel):
+    id: str
+    conversation_id: str
+    client_turn_id: str
+    status: ConversationTurnStatus
+    question: str
+    answer: str | None = None
+    citations: list[Citation] = Field(default_factory=list)
+    no_answer: bool = False
+    top_k: int | None = None
+    document_ids: list[str] | None = None
+    request_id: str | None = None
+    error_code: str | None = None
+    retryable: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConversationTurnList(BaseModel):
+    items: list[ConversationTurn]
+    total: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    offset: int = Field(ge=0)
+
+
+class ConversationTurnReservation(BaseModel):
+    turn: ConversationTurn
+    created: bool
+    cached_turn: ConversationTurn | None = None
+    reservation_token: str | None = Field(default=None, min_length=32, max_length=128, repr=False)
 
 
 class ChatResponse(BaseModel):

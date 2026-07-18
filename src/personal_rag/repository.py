@@ -1,4 +1,4 @@
-"""Transactional persistence for documents, ingestion jobs, and worker state."""
+"""Transactional persistence for conversations, documents, jobs, and worker state."""
 
 from __future__ import annotations
 
@@ -15,6 +15,12 @@ from uuid import uuid4
 from personal_rag.database import Database
 from personal_rag.errors import RagError
 from personal_rag.models import (
+    ChatHistoryMessage,
+    Citation,
+    ConversationSummary,
+    ConversationTurn,
+    ConversationTurnReservation,
+    ConversationTurnStatus,
     DocumentPublic,
     DocumentRecord,
     DocumentStatus,
@@ -110,6 +116,583 @@ class Repository:
 
     def initialize(self) -> None:
         self.database.initialize()
+
+    def create_conversation(
+        self,
+        title: str | None = None,
+        *,
+        conversation_id: str | None = None,
+    ) -> ConversationSummary:
+        """Create an empty durable conversation."""
+
+        normalized_title = (
+            "New conversation" if title is None else self._validated_conversation_title(title)
+        )
+        identifier = self._validated_identifier(conversation_id or uuid4().hex, "conversation_id")
+        now_text = self._serialize_datetime(self._now())
+        try:
+            with self.database.transaction(immediate=True) as connection:
+                connection.execute(
+                    """
+                    INSERT INTO conversations (id, title, created_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (identifier, normalized_title, now_text, now_text),
+                )
+                return self._conversation_summary_from_row(
+                    connection,
+                    connection.execute(
+                        "SELECT * FROM conversations WHERE id = ?", (identifier,)
+                    ).fetchone(),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise RagError(
+                "persistence_conflict",
+                "The conversation identifier is already in use",
+                status_code=409,
+            ) from exc
+
+    def get_conversation(self, conversation_id: str) -> ConversationSummary | None:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE id = ?", (conversation_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return self._conversation_summary_from_row(connection, row)
+
+    def list_conversations(self, *, limit: int = 50, offset: int = 0) -> list[ConversationSummary]:
+        self._validate_pagination(limit, offset)
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM conversations
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+            return [self._conversation_summary_from_row(connection, row) for row in rows]
+
+    def count_conversations(self) -> int:
+        with self.database.connection() as connection:
+            row = connection.execute("SELECT COUNT(*) AS total FROM conversations").fetchone()
+        return int(row["total"])
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        """Hard-delete a conversation and all retained answer/source content."""
+
+        with self.database.transaction(immediate=True) as connection:
+            deleted = connection.execute(
+                "DELETE FROM conversations WHERE id = ?", (conversation_id,)
+            )
+        return deleted.rowcount == 1
+
+    def get_conversation_turn(self, turn_id: str) -> ConversationTurn | None:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversation_turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+            return self._conversation_turn_from_row(connection, row) if row is not None else None
+
+    def list_conversation_turns(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        include_incomplete: bool = False,
+    ) -> list[ConversationTurn]:
+        self._validate_pagination(limit, offset)
+        query = (
+            """
+            SELECT * FROM conversation_turns
+            WHERE conversation_id = ?
+            ORDER BY created_at, rowid
+            LIMIT ? OFFSET ?
+            """
+            if include_incomplete
+            else """
+            SELECT * FROM conversation_turns
+            WHERE conversation_id = ? AND status = 'completed'
+            ORDER BY created_at, rowid
+            LIMIT ? OFFSET ?
+            """
+        )
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                query,
+                (conversation_id, limit, offset),
+            ).fetchall()
+            return [self._conversation_turn_from_row(connection, row) for row in rows]
+
+    def count_conversation_turns(
+        self, conversation_id: str, *, include_incomplete: bool = False
+    ) -> int:
+        query = (
+            """
+            SELECT COUNT(*) AS total
+            FROM conversation_turns
+            WHERE conversation_id = ?
+            """
+            if include_incomplete
+            else """
+            SELECT COUNT(*) AS total
+            FROM conversation_turns
+            WHERE conversation_id = ? AND status = 'completed'
+            """
+        )
+        with self.database.connection() as connection:
+            row = connection.execute(
+                query,
+                (conversation_id,),
+            ).fetchone()
+        return int(row["total"])
+
+    def reserve_conversation_turn(
+        self,
+        conversation_id: str,
+        *,
+        client_turn_id: str,
+        question: str,
+        top_k: int | None,
+        document_ids: Sequence[str] | None,
+        request_fingerprint: str,
+        reservation_seconds: int = 120,
+    ) -> ConversationTurnReservation:
+        """Atomically reserve one paid turn or return its persisted result."""
+
+        normalized_conversation_id = self._validated_identifier(conversation_id, "conversation_id")
+        normalized_client_turn_id = self._validated_client_turn_id(client_turn_id)
+        normalized_question = self._validated_conversation_text(question, "question", 4_000)
+        normalized_top_k = self._validated_top_k(top_k)
+        normalized_document_ids = self._validated_document_ids(document_ids)
+        normalized_fingerprint = request_fingerprint.lower()
+        if _HASH_PATTERN.fullmatch(normalized_fingerprint) is None:
+            raise ValueError("request_fingerprint must be a lowercase SHA-256 hex digest")
+        if reservation_seconds < 1 or reservation_seconds > 3_600:
+            raise ValueError("reservation_seconds must be between 1 and 3600")
+
+        now = self._now()
+        now_text = self._serialize_datetime(now)
+        expires_text = self._serialize_datetime(now + timedelta(seconds=reservation_seconds))
+        with self.database.transaction(immediate=True) as connection:
+            conversation = connection.execute(
+                "SELECT id FROM conversations WHERE id = ?",
+                (normalized_conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise RagError(
+                    "conversation_not_found",
+                    "The requested conversation does not exist.",
+                    status_code=404,
+                )
+
+            existing = connection.execute(
+                """
+                SELECT * FROM conversation_turns
+                WHERE conversation_id = ? AND client_turn_id = ?
+                """,
+                (normalized_conversation_id, normalized_client_turn_id),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_fingerprint"] != normalized_fingerprint:
+                    raise RagError(
+                        "idempotency_conflict",
+                        "This client turn identifier was already used for a different question.",
+                        status_code=409,
+                    )
+                turn = self._conversation_turn_from_row(connection, existing)
+                if turn.status is ConversationTurnStatus.COMPLETED or (
+                    turn.status is ConversationTurnStatus.FAILED and not turn.retryable
+                ):
+                    return ConversationTurnReservation(turn=turn, created=False, cached_turn=turn)
+                if turn.status is ConversationTurnStatus.FAILED and turn.retryable:
+                    reservation_token = uuid4().hex
+                    connection.execute(
+                        """
+                        UPDATE conversation_turns
+                        SET status = 'pending', error_code = NULL, retryable = 0,
+                            reservation_expires_at = ?, reservation_token = ?, updated_at = ?
+                        WHERE id = ? AND status = 'failed'
+                        """,
+                        (expires_text, reservation_token, now_text, existing["id"]),
+                    )
+                    retry = connection.execute(
+                        "SELECT * FROM conversation_turns WHERE id = ?",
+                        (existing["id"],),
+                    ).fetchone()
+                    return ConversationTurnReservation(
+                        turn=self._conversation_turn_from_row(connection, retry),
+                        created=True,
+                        reservation_token=reservation_token,
+                    )
+                expiry = existing["reservation_expires_at"]
+                if expiry is not None and self._parse_datetime(expiry) > now:
+                    raise RagError(
+                        "conversation_turn_in_progress",
+                        "This question is already being answered.",
+                        status_code=409,
+                        retryable=True,
+                    )
+                reservation_token = uuid4().hex
+                connection.execute(
+                    """
+                    UPDATE conversation_turns
+                    SET reservation_expires_at = ?, reservation_token = ?, updated_at = ?
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (expires_text, reservation_token, now_text, existing["id"]),
+                )
+                recovered = connection.execute(
+                    "SELECT * FROM conversation_turns WHERE id = ?",
+                    (existing["id"],),
+                ).fetchone()
+                return ConversationTurnReservation(
+                    turn=self._conversation_turn_from_row(connection, recovered),
+                    created=True,
+                    reservation_token=reservation_token,
+                )
+
+            turn_id = uuid4().hex
+            reservation_token = uuid4().hex
+            connection.execute(
+                """
+                INSERT INTO conversation_turns (
+                    id, conversation_id, client_turn_id, request_fingerprint,
+                    reservation_token, status, question, top_k, document_ids_json,
+                    reservation_expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    turn_id,
+                    normalized_conversation_id,
+                    normalized_client_turn_id,
+                    normalized_fingerprint,
+                    reservation_token,
+                    ConversationTurnStatus.PENDING.value,
+                    normalized_question,
+                    normalized_top_k,
+                    (
+                        json.dumps(normalized_document_ids, separators=(",", ":"))
+                        if normalized_document_ids is not None
+                        else None
+                    ),
+                    expires_text,
+                    now_text,
+                    now_text,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM conversation_turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+            return ConversationTurnReservation(
+                turn=self._conversation_turn_from_row(connection, row),
+                created=True,
+                reservation_token=reservation_token,
+            )
+
+    def renew_conversation_turn_reservation(
+        self,
+        turn_id: str,
+        *,
+        reservation_token: str,
+        reservation_seconds: int = 120,
+    ) -> bool:
+        """Extend only the currently owned paid-call reservation."""
+
+        normalized_turn_id = self._validated_identifier(turn_id, "turn_id")
+        normalized_token = self._validated_identifier(reservation_token, "reservation_token")
+        if reservation_seconds < 1 or reservation_seconds > 3_600:
+            raise ValueError("reservation_seconds must be between 1 and 3600")
+        now = self._now()
+        with self.database.transaction(immediate=True) as connection:
+            renewed = connection.execute(
+                """
+                UPDATE conversation_turns
+                SET reservation_expires_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'pending' AND reservation_token = ?
+                """,
+                (
+                    self._serialize_datetime(now + timedelta(seconds=reservation_seconds)),
+                    self._serialize_datetime(now),
+                    normalized_turn_id,
+                    normalized_token,
+                ),
+            )
+        return renewed.rowcount == 1
+
+    def complete_conversation_turn(
+        self,
+        turn_id: str,
+        *,
+        reservation_token: str,
+        answer: str,
+        citations: Sequence[Citation],
+        no_answer: bool,
+        request_id: str | None,
+    ) -> ConversationTurn:
+        """Persist one grounded result and advance conversation recency atomically."""
+
+        normalized_answer = self._validated_conversation_text(answer, "answer", 12_000)
+        normalized_citations = [
+            self._validated_citation(Citation.model_validate(citation)) for citation in citations
+        ]
+        if len(normalized_citations) > 50:
+            raise ValueError("at most 50 citations may be persisted")
+        normalized_request_id = (
+            None if request_id is None else self._validated_identifier(request_id, "request_id")
+        )
+        normalized_token = self._validated_identifier(reservation_token, "reservation_token")
+        now = self._now()
+        now_text = self._serialize_datetime(now)
+        with self.database.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM conversation_turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+            if row is None:
+                raise RagError(
+                    "conversation_turn_not_found",
+                    "The requested conversation turn does not exist.",
+                    status_code=404,
+                )
+            status = ConversationTurnStatus(row["status"])
+            if status is ConversationTurnStatus.COMPLETED:
+                return self._conversation_turn_from_row(connection, row)
+            if status is not ConversationTurnStatus.PENDING:
+                raise RagError(
+                    "invalid_conversation_turn_transition",
+                    "Only a pending conversation turn can be completed.",
+                    status_code=409,
+                )
+            if row["reservation_token"] != normalized_token:
+                raise RagError(
+                    "conversation_turn_lease_lost",
+                    "This question is being completed by a newer request.",
+                    status_code=409,
+                    retryable=True,
+                )
+
+            cited_document_ids = list(
+                dict.fromkeys(citation.document_id for citation in normalized_citations)
+            )
+            for document_id in cited_document_ids:
+                document = connection.execute(
+                    "SELECT status FROM documents WHERE id = ?",
+                    (document_id,),
+                ).fetchone()
+                if (
+                    document is None
+                    or DocumentStatus(document["status"]) is not DocumentStatus.READY
+                ):
+                    raise RagError(
+                        "source_changed",
+                        "A source changed while the answer was being prepared. Please try again.",
+                        status_code=409,
+                        retryable=True,
+                    )
+
+            for ordinal, citation in enumerate(normalized_citations):
+                connection.execute(
+                    """
+                    INSERT INTO turn_citations (
+                        turn_id, ordinal, label, document_id, chunk_id,
+                        document_name, page_number, section, snippet, score
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        turn_id,
+                        ordinal,
+                        citation.label,
+                        citation.document_id,
+                        citation.chunk_id,
+                        citation.document_name,
+                        citation.page_number,
+                        citation.section,
+                        citation.snippet,
+                        citation.score,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE conversation_turns
+                SET status = ?, answer = ?, no_answer = ?, request_id = ?,
+                    error_code = NULL, retryable = 0, reservation_expires_at = NULL,
+                    reservation_token = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    ConversationTurnStatus.COMPLETED.value,
+                    normalized_answer,
+                    int(no_answer),
+                    normalized_request_id,
+                    now_text,
+                    turn_id,
+                ),
+            )
+            completed_before = connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM conversation_turns
+                WHERE conversation_id = ? AND status = 'completed' AND id <> ?
+                """,
+                (row["conversation_id"], turn_id),
+            ).fetchone()
+            conversation = connection.execute(
+                "SELECT title FROM conversations WHERE id = ?",
+                (row["conversation_id"],),
+            ).fetchone()
+            title = str(conversation["title"])
+            if int(completed_before["total"]) == 0 and title == "New conversation":
+                title = self._derived_conversation_title(str(row["question"]))
+            connection.execute(
+                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+                (title, now_text, row["conversation_id"]),
+            )
+            completed = connection.execute(
+                "SELECT * FROM conversation_turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+            return self._conversation_turn_from_row(connection, completed)
+
+    def fail_conversation_turn(
+        self,
+        turn_id: str,
+        *,
+        reservation_token: str,
+        error_code: str,
+        retryable: bool,
+    ) -> ConversationTurn:
+        """Store only safe failure metadata; never persist provider exception text."""
+
+        normalized_code = self._validated_error_text(error_code, "error_code", 100)
+        normalized_token = self._validated_identifier(reservation_token, "reservation_token")
+        now_text = self._serialize_datetime(self._now())
+        with self.database.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM conversation_turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+            if row is None:
+                raise RagError(
+                    "conversation_turn_not_found",
+                    "The requested conversation turn does not exist.",
+                    status_code=404,
+                )
+            status = ConversationTurnStatus(row["status"])
+            if status is ConversationTurnStatus.COMPLETED:
+                return self._conversation_turn_from_row(connection, row)
+            if (
+                status is ConversationTurnStatus.PENDING
+                and row["reservation_token"] == normalized_token
+            ):
+                connection.execute(
+                    """
+                    UPDATE conversation_turns
+                    SET status = ?, error_code = ?, retryable = ?,
+                        reservation_expires_at = NULL, reservation_token = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        ConversationTurnStatus.FAILED.value,
+                        normalized_code,
+                        int(retryable),
+                        now_text,
+                        turn_id,
+                    ),
+                )
+            failed = connection.execute(
+                "SELECT * FROM conversation_turns WHERE id = ?", (turn_id,)
+            ).fetchone()
+            return self._conversation_turn_from_row(connection, failed)
+
+    def conversation_history(self, conversation_id: str, *, limit: int) -> list[ChatHistoryMessage]:
+        """Reconstruct a bounded message window only from completed turns."""
+
+        if limit < 0 or limit > 100:
+            raise ValueError("limit must be between 0 and 100")
+        if limit == 0:
+            return []
+        turn_limit = limit // 2
+        if turn_limit == 0:
+            return []
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT question, answer
+                FROM conversation_turns
+                WHERE conversation_id = ? AND status = 'completed'
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (conversation_id, turn_limit),
+            ).fetchall()
+        messages: list[ChatHistoryMessage] = []
+        for row in reversed(rows):
+            messages.append(ChatHistoryMessage(role="user", content=str(row["question"])))
+            messages.append(ChatHistoryMessage(role="assistant", content=str(row["answer"])))
+        return messages
+
+    def purge_conversation_turns_for_document(
+        self, connection: sqlite3.Connection, document_id: str
+    ) -> int:
+        """Delete whole turns that retain content from a document being deleted."""
+
+        affected = connection.execute(
+            """
+            SELECT DISTINCT conversation_turns.conversation_id
+            FROM conversation_turns
+            JOIN turn_citations ON turn_citations.turn_id = conversation_turns.id
+            WHERE turn_citations.document_id = ?
+            """,
+            (document_id,),
+        ).fetchall()
+        deleted = connection.execute(
+            """
+            DELETE FROM conversation_turns
+            WHERE id IN (
+                SELECT turn_id FROM turn_citations WHERE document_id = ?
+            )
+            """,
+            (document_id,),
+        )
+        now_text = self._serialize_datetime(self._now())
+        for row in affected:
+            conversation_id = str(row["conversation_id"])
+            remaining = connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM conversation_turns
+                WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+            if int(remaining["total"]) == 0:
+                connection.execute(
+                    "DELETE FROM conversations WHERE id = ?",
+                    (conversation_id,),
+                )
+                continue
+            first_completed = connection.execute(
+                """
+                SELECT question
+                FROM conversation_turns
+                WHERE conversation_id = ? AND status = 'completed'
+                ORDER BY created_at, rowid
+                LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+            title = (
+                self._derived_conversation_title(str(first_completed["question"]))
+                if first_completed is not None
+                else "New conversation"
+            )
+            connection.execute(
+                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
+                (title, now_text, conversation_id),
+            )
+        return deleted.rowcount
 
     def create_document_with_job(
         self,
@@ -761,6 +1344,7 @@ class Repository:
                 connection, job["document_id"], include_deleted=True
             )
             if kind is JobKind.DELETE:
+                self.purge_conversation_turns_for_document(connection, str(job["document_id"]))
                 self._set_document_state(
                     connection, document, DocumentStatus.DELETED, now, clear_error=True
                 )
@@ -1240,6 +1824,76 @@ class Repository:
     def _document_from_row(row: sqlite3.Row) -> DocumentRecord:
         return DocumentRecord.model_validate(dict(row))
 
+    def _conversation_summary_from_row(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> ConversationSummary:
+        count = connection.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM conversation_turns
+            WHERE conversation_id = ? AND status = 'completed'
+            """,
+            (row["id"],),
+        ).fetchone()
+        return ConversationSummary(
+            id=str(row["id"]),
+            title=str(row["title"]),
+            turn_count=int(count["total"]),
+            created_at=self._parse_datetime(str(row["created_at"])),
+            updated_at=self._parse_datetime(str(row["updated_at"])),
+        )
+
+    def _conversation_turn_from_row(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> ConversationTurn:
+        citation_rows = connection.execute(
+            """
+            SELECT * FROM turn_citations
+            WHERE turn_id = ?
+            ORDER BY ordinal
+            """,
+            (row["id"],),
+        ).fetchall()
+        citations = [
+            Citation(
+                label=str(citation["label"]),
+                document_id=str(citation["document_id"]),
+                chunk_id=str(citation["chunk_id"]),
+                document_name=str(citation["document_name"]),
+                page_number=(
+                    int(citation["page_number"]) if citation["page_number"] is not None else None
+                ),
+                section=(str(citation["section"]) if citation["section"] is not None else None),
+                snippet=str(citation["snippet"]),
+                score=float(citation["score"]) if citation["score"] is not None else None,
+            )
+            for citation in citation_rows
+        ]
+        document_ids_raw = row["document_ids_json"]
+        document_ids: list[str] | None = None
+        if document_ids_raw is not None:
+            parsed = json.loads(str(document_ids_raw))
+            if not isinstance(parsed, list) or not all(isinstance(value, str) for value in parsed):
+                raise RuntimeError("Persisted conversation document scope is invalid")
+            document_ids = parsed
+        return ConversationTurn(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            client_turn_id=str(row["client_turn_id"]),
+            status=ConversationTurnStatus(row["status"]),
+            question=str(row["question"]),
+            answer=str(row["answer"]) if row["answer"] is not None else None,
+            citations=citations,
+            no_answer=bool(row["no_answer"]),
+            top_k=int(row["top_k"]) if row["top_k"] is not None else None,
+            document_ids=document_ids,
+            request_id=str(row["request_id"]) if row["request_id"] is not None else None,
+            error_code=(str(row["error_code"]) if row["error_code"] is not None else None),
+            retryable=bool(row["retryable"]),
+            created_at=self._parse_datetime(str(row["created_at"])),
+            updated_at=self._parse_datetime(str(row["updated_at"])),
+        )
+
     @staticmethod
     def _job_from_row(row: sqlite3.Row) -> JobRecord:
         return JobRecord.model_validate(dict(row))
@@ -1298,6 +1952,77 @@ class Repository:
         if not normalized or len(normalized) > 128 or any(ord(char) < 32 for char in normalized):
             raise ValueError(f"{field} must contain 1 to 128 safe characters")
         return normalized
+
+    @classmethod
+    def _validated_client_turn_id(cls, value: str) -> str:
+        normalized = cls._validated_identifier(value, "client_turn_id")
+        if len(normalized) < 8:
+            raise ValueError("client_turn_id must contain 8 to 128 safe characters")
+        return normalized
+
+    @staticmethod
+    def _validated_conversation_text(value: str, field: str, maximum: int) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be text")
+        normalized = value.strip()
+        if not normalized or len(normalized) > maximum or "\x00" in normalized:
+            raise ValueError(f"{field} must contain 1 to {maximum} safe characters")
+        return normalized
+
+    @classmethod
+    def _validated_conversation_title(cls, value: str) -> str:
+        normalized = " ".join(cls._validated_conversation_text(value, "title", 120).split())
+        if not normalized:
+            raise ValueError("title must contain 1 to 120 safe characters")
+        return normalized
+
+    @staticmethod
+    def _validated_top_k(value: int | None) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 50:
+            raise ValueError("top_k must be between 1 and 50")
+        return value
+
+    @classmethod
+    def _validated_document_ids(cls, values: Sequence[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        normalized = [cls._validated_identifier(value, "document_id") for value in values]
+        unique = list(dict.fromkeys(normalized))
+        if len(unique) > 100:
+            raise ValueError("at most 100 document identifiers may be stored")
+        return unique
+
+    @classmethod
+    def _validated_citation(cls, citation: Citation) -> Citation:
+        label = cls._validated_conversation_text(citation.label, "citation label", 32)
+        document_id = cls._validated_identifier(citation.document_id, "citation document_id")
+        chunk_id = cls._validated_identifier(citation.chunk_id, "citation chunk_id")
+        document_name = cls._validated_conversation_text(
+            citation.document_name, "citation document_name", 255
+        )
+        section = (
+            cls._validated_conversation_text(citation.section, "citation section", 1_000)
+            if citation.section is not None
+            else None
+        )
+        snippet = cls._validated_conversation_text(citation.snippet, "citation snippet", 2_000)
+        return citation.model_copy(
+            update={
+                "label": label,
+                "document_id": document_id,
+                "chunk_id": chunk_id,
+                "document_name": document_name,
+                "section": section,
+                "snippet": snippet,
+            }
+        )
+
+    @classmethod
+    def _derived_conversation_title(cls, question: str) -> str:
+        normalized = " ".join(cls._validated_conversation_text(question, "question", 4_000).split())
+        return normalized if len(normalized) <= 72 else f"{normalized[:71].rstrip()}…"
 
     @classmethod
     def _validated_worker_id(cls, value: str) -> str:

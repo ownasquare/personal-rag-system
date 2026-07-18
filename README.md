@@ -1,22 +1,24 @@
-# Personal Knowledge Studio
+# Personal Library
 
-Personal Knowledge Studio is a private, production-grade personal RAG system. Upload PDFs, Word
-documents, Markdown, or text; let a durable worker index them with LlamaIndex and Qdrant; then ask
-questions in Streamlit and inspect the exact sources behind each answer.
+Personal Library is a private, production-grade personal RAG system with a deliberately ordinary
+document-workspace interface. Add PDFs, Word documents, Markdown, or text; let a durable worker
+index them with LlamaIndex and Qdrant; then keep saved conversations and inspect the exact passages
+behind each answer.
 
 This release is deliberately engineered for one user on one host. It has durable jobs, strict
-upload bounds, content-hash deduplication, crash recovery, backend-built citations, verified
-deletion, authentication, readiness/metrics, deterministic no-cost tests, locked dependencies,
-backup/restore tools, and a production-shaped Compose topology.
+upload bounds, content-hash deduplication, crash recovery, backend-built citations, durable
+conversation turns, refresh-safe activity, verified deletion, authentication, readiness/metrics,
+deterministic no-cost tests, locked dependencies, backup/restore tools, and a production-shaped
+Compose topology.
 
 ## What it includes
 
 - FastAPI as the only public system-of-record API
-- Streamlit Chat, Library, and Settings & Status areas
+- Calm Streamlit Ask, Documents, Activity, and secondary System views
 - OpenAI `text-embedding-3-large` or Voyage `voyage-3-large` embeddings
 - OpenAI answer-model generation, configured independently from embeddings
 - Persistent Qdrant vector storage with immutable embedding-profile checks
-- SQLite WAL manifest and durable ingest/reindex/delete jobs
+- SQLite WAL manifest with durable ingest/reindex/delete jobs and saved cited conversations
 - Separate worker with atomic leases, heartbeat, bounded retries, and crash reclamation
 - PDF, DOCX, Markdown, and text parsing with page/section citation metadata
 - SHA-256 deduplication and optional request idempotency keys
@@ -28,7 +30,7 @@ backup/restore tools, and a production-shaped Compose topology.
 ## Architecture
 
 ```text
-Browser -> Streamlit -> FastAPI -> SQLite manifest + private upload storage
+Browser -> Streamlit -> FastAPI -> SQLite manifest, conversations + private upload storage
                          |   \
                          |    -> LlamaIndex retrieval -> Qdrant -> OpenAI answer model
                          |
@@ -114,15 +116,20 @@ reindex; vectors with different dimensions are never mixed in one collection. Fo
 
 ## Use the app
 
-1. Open **Library**, select one or more supported files, and click **Add to library**.
-2. Watch durable job state progress from queued through ready. A refresh re-reads state from the
-   API rather than losing it.
-3. Open **Chat**, ask a question, and expand citation cards for filename, page/section, snippet,
-   stable chunk ID, and raw retrieval score.
-4. Reindex or delete from **Library**. Deletion is not reported complete until Qdrant readback is
-   zero and the retained source file is removed.
-5. Use **Settings & Status** for sanitized models, counts, and dependency health. Keys and storage
-   paths are never displayed.
+1. Open **Ask**. If the library is empty, the first-run surface explains the three-step flow and
+   accepts one or more supported files.
+2. Follow durable progress in **Activity**. Jobs are restored from the API after a refresh or a
+   closed browser; newly accepted work appears there immediately. Choose **Refresh** when you want
+   the latest state—terminal activity does not create a permanent background polling loop.
+3. Ask a question and open **Sources** to read the filename, page or section, and exact supporting
+   passage. Retrieval scoring stays out of the normal reading experience.
+4. Start a new conversation or reopen a saved one. Completed, pending, and failed turn truth is
+   stored by the API. Saved pending and retryable turns expose a one-click retry, while an edited
+   question receives a new client turn ID so idempotency remains correct.
+5. Use **Documents** to search the current bounded library, refresh a failed or stale document, or
+   confirm permanent removal. A successful source deletion also removes saved turns that cite it.
+6. Open **System** only for sanitized setup and dependency details. Keys and storage paths are
+   never displayed.
 
 ## API
 
@@ -136,8 +143,9 @@ All `/api/v1/*` routes use `Authorization: Bearer <RAG_API_KEY>` when auth is en
 | Document detail | `GET /api/v1/documents/{id}` |
 | Reindex | `POST /api/v1/documents/{id}/reindex` |
 | Verified deletion | `DELETE /api/v1/documents/{id}` |
-| Durable job readback | `GET /api/v1/jobs/{id}` |
-| Grounded chat | `POST /api/v1/chat` |
+| Recent activity / job readback | `GET /api/v1/jobs`, `GET /api/v1/jobs/{id}` |
+| Durable conversations | `POST`, `GET`, `DELETE /api/v1/conversations...` |
+| Stateless grounded chat compatibility | `POST /api/v1/chat` |
 | Prometheus metrics | `GET /metrics` |
 
 See the complete [API contract](docs/api.md).
@@ -181,14 +189,19 @@ identity-aware access layer such as OIDC. Do not publish Qdrant.
 - [HTTP API](docs/api.md)
 - [Validation evidence and proof boundaries](docs/validation.md)
 - [Implementation completion record](docs/personal-rag/2026-07-17-production-rag-implementation.md)
+- [Phase 2 completion record](docs/personal-rag/2026-07-17-product-experience-phase-2.md)
 - [Implementation plan](docs/superpowers/plans/2026-07-17-personal-rag-system.md)
+- [Phase 2 product-experience plan](docs/superpowers/plans/2026-07-17-personal-rag-product-experience-phase-2.md)
 
 ## Honest limitations
 
 - This release is single-user and single-host, not multi-tenant or highly available.
 - Scanned image-only PDFs require an external OCR stage and are rejected instead of silently
   indexing empty content.
-- Streamlit chat history is presentation-session state; documents and jobs are durable.
+- Completed conversation turns are durable. An unsubmitted text-area draft remains browser-session
+  state; retryable submitted turns retain their server reservation and safe failure state.
+- Document search is intentionally bounded to records loaded by the single-user UI. Server-side
+  full-text library search, tags, collections, and renaming are deferred.
 - Compose backup requires both application and Qdrant volumes to be snapshotted in one stopped
   window. The local backup script cannot snapshot a separate container volume.
 - Live provider behavior, cost, quota, and privacy remain account/provider concerns and are kept

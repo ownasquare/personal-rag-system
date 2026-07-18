@@ -2,10 +2,11 @@
 
 ## Protected assets
 
-The system protects document bytes, extracted text, vector embeddings, answers, citations,
-provider keys, the local bearer token, job metadata, backups, and internal storage paths. The
-default Compose configuration binds FastAPI, Streamlit, and authenticated Qdrant only to host
-loopback. Qdrant also stays on the private Compose network and requires a separate API key.
+The system protects document bytes, extracted text, vector embeddings, saved conversations,
+questions, answers, citations, provider keys, the local bearer token, job metadata, backups, and
+internal storage paths. The default Compose configuration binds FastAPI, Streamlit, and
+authenticated Qdrant only to host loopback. Qdrant also stays on the private Compose network and
+requires a separate API key.
 
 ## Authentication and network exposure
 
@@ -55,9 +56,14 @@ loopback. Qdrant also stays on the private Compose network and requires a separa
   a mathematical proof that every sentence is semantically faithful.
 - Query size, history depth, retrieval count, context size, provider attempts, and job attempts
   are bounded.
+- Conversation turn creation is idempotent by a caller-generated client turn ID and request
+  fingerprint. A completed retry reads persisted server truth, an active duplicate is rejected,
+  and each live request renews a random ownership token. Completion, failure, and renewal are
+  fenced by that token so an expired attempt cannot mutate a newer recovery.
 - Retrieval is authorized against SQLite ready-version truth before the vector query, after
   retrieval, and again before citations are returned. Stale vectors cannot make a non-ready
-  document visible.
+  document visible. The conversation commit transaction independently rechecks every cited
+  document, closing the race between provider completion and source deletion/reindexing.
 - Low-support questions abstain. The service does not present a plausible unsupported answer as
   grounded.
 
@@ -80,16 +86,19 @@ every privacy or compliance regime.
 
 ## Deletion and backups
 
-Primary deletion is not reported complete until vector readback is zero and the retained source
-file is unlinked. This is logical deletion, not guaranteed secure erasure from flash media,
-filesystem snapshots, or provider systems. Document and job lifecycle metadata remains in SQLite
-for operational history after content deletion.
+Primary deletion is not reported complete until vector readback is zero, the retained source file
+is unlinked, and every saved turn whose normalized citation references that document is purged.
+If the removal empties a conversation, that conversation is deleted; otherwise its title is
+recomputed from the remaining history. This is logical deletion, not guaranteed secure erasure
+from flash media, filesystem snapshots, or provider systems. Document and job lifecycle metadata
+remains in SQLite for operational history after content deletion.
 
-Live application volumes contain plaintext source files, SQLite metadata, and vector data unless
-the host or volume layer provides encryption at rest. Offline backups are immutable copies:
-deleting primary data does not erase an older backup. Operators must choose and enforce a backup
-retention policy, protect live volumes and archives with filesystem permissions and host/volume
-encryption appropriate to the threat model, and destroy expired backups.
+Live application volumes contain plaintext source files, saved questions and answers, citation
+snippets, SQLite metadata, and vector data unless the host or volume layer provides encryption at
+rest. Offline backups are immutable copies: deleting primary data does not erase an older backup.
+Operators must choose and enforce a backup retention policy, protect live volumes and archives
+with filesystem permissions and host/volume encryption appropriate to the threat model, and
+destroy expired backups.
 
 Backup creation refuses any output path inside the application data directory, preventing the
 archive's temporary tree from recursively entering the upload or vector copy source.

@@ -185,6 +185,8 @@ class JobProcessor:
         self.rag_service.delete_document(job.document_id)
         self._remove_stored_file(document)
         self._heartbeat(job.id, worker_id)
+        # Repository completion also removes persisted turns that retain cited
+        # content before the document can become privacy-complete.
         self.repository.complete_job(job.id, worker_id)
 
     def _heartbeat(self, job_id: str, worker_id: str) -> None:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from filelock import FileLock
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _MIGRATION_V1 = """
 BEGIN IMMEDIATE;
@@ -98,6 +98,83 @@ PRAGMA user_version = 1;
 COMMIT;
 """
 
+_MIGRATION_V2 = """
+BEGIN IMMEDIATE;
+
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_conversations_updated
+ON conversations (updated_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    client_turn_id TEXT NOT NULL CHECK (length(client_turn_id) BETWEEN 8 AND 128),
+    request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 64),
+    reservation_token TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+    question TEXT NOT NULL CHECK (length(question) BETWEEN 1 AND 4000),
+    answer TEXT,
+    no_answer INTEGER NOT NULL DEFAULT 0 CHECK (no_answer IN (0, 1)),
+    top_k INTEGER CHECK (top_k BETWEEN 1 AND 50),
+    document_ids_json TEXT CHECK (
+        document_ids_json IS NULL OR json_valid(document_ids_json)
+    ),
+    request_id TEXT,
+    error_code TEXT,
+    retryable INTEGER NOT NULL DEFAULT 0 CHECK (retryable IN (0, 1)),
+    reservation_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (conversation_id, client_turn_id),
+    CHECK (
+        (
+            status = 'pending' AND answer IS NULL
+            AND reservation_expires_at IS NOT NULL AND reservation_token IS NOT NULL
+        )
+        OR (
+            status = 'completed' AND answer IS NOT NULL
+            AND reservation_expires_at IS NULL AND reservation_token IS NULL
+        )
+        OR (
+            status = 'failed' AND answer IS NULL
+            AND reservation_expires_at IS NULL AND reservation_token IS NULL
+        )
+    )
+);
+
+CREATE INDEX IF NOT EXISTS ix_conversation_turns_list
+ON conversation_turns (conversation_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS ix_conversation_turns_reservations
+ON conversation_turns (status, reservation_expires_at);
+
+CREATE TABLE IF NOT EXISTS turn_citations (
+    turn_id TEXT NOT NULL REFERENCES conversation_turns(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    label TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    document_name TEXT NOT NULL,
+    page_number INTEGER,
+    section TEXT,
+    snippet TEXT NOT NULL,
+    score REAL,
+    PRIMARY KEY (turn_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS ix_turn_citations_document
+ON turn_citations (document_id, turn_id);
+
+PRAGMA user_version = 2;
+COMMIT;
+"""
+
 
 class Database:
     """Create short-lived SQLite connections with one consistent safety policy."""
@@ -125,6 +202,14 @@ class Database:
                 )
             if version < 1:
                 connection.executescript(_MIGRATION_V1)
+            if version < 2:
+                connection.executescript(_MIGRATION_V2)
+
+    def schema_version(self) -> int:
+        """Return the persisted schema version without changing the database."""
+
+        with self.connection() as connection:
+            return int(connection.execute("PRAGMA user_version").fetchone()[0])
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

@@ -77,6 +77,28 @@ make ui
 Open `http://127.0.0.1:8501`. FastAPI documentation is available at
 `http://127.0.0.1:8000/docs` in development only.
 
+### Conversations and activity
+
+Personal Library stores conversations, questions, grounded answers, and their normalized
+citations in the same SQLite database as document and job metadata. Conversation writes are
+idempotent by client turn ID: reloading or retrying an already completed question returns the
+persisted result without repeating a provider call. An interrupted pending reservation can be
+recovered after its lease expires, and retryable failures can be submitted again with the same
+client turn ID. Live requests renew an internal reservation lease, and ownership fencing prevents
+a late provider result from overwriting a newer recovery attempt.
+
+The Activity view is durable rather than browser-session state. It reads the bounded recent-jobs
+endpoint, so an upload, refresh, or removal remains visible after a page reload. The worker is
+still authoritative for completion; leaving the Activity view does not cancel queued work. Use
+the visible Refresh action for current progress. The UI intentionally stops automatic background
+requests rather than polling forever after work becomes terminal.
+
+Schema v2 is a forward-only startup migration. It adds conversation, turn, and citation tables
+without rewriting schema-v1 document or job rows. Before upgrading an existing installation,
+stop writers and create the coordinated offline backup described below. A v2 database cannot be
+downgraded in place; rollback restores the pre-upgrade SQLite database and matching vector/source
+data together.
+
 ## Single-host Compose deployment
 
 ```bash
@@ -130,6 +152,11 @@ uv run python scripts/backup.py \
 3. Store the mode-`0600` archive in encrypted storage with a defined retention period.
 4. Restart services and confirm readiness.
 
+The application-data archive includes the SQLite conversation history. Treat it as document
+content: answers and citation snippets can reveal source material even when the original upload
+is not opened. A restore test should therefore verify both a known citation and a saved
+conversation, then delete a fixture document and confirm its cited turns no longer appear.
+
 Compose named volumes require an infrastructure-level offline snapshot of both `app_data` and
 `qdrant_data` in the same stopped window. The local script cannot reach a separate Qdrant volume
 and does not claim to back it up.
@@ -175,5 +202,9 @@ tree is never treated as an authorized path.
   reindex. Do not point a new dimension at an existing collection.
 - **Document failed:** inspect its safe error code in Library; encrypted, image-only, corrupt,
   unsupported, empty, and oversized files require different corrective action.
+- **Question appears pending:** wait for the active reservation lease before retrying. The same
+  client turn ID prevents a duplicate paid call; a retryable failed turn can safely be retried.
+- **Activity is empty after an action:** refresh the page once and verify the API/worker are using
+  the same SQLite data directory. Recent activity comes from persisted jobs, not browser memory.
 - **Deletion failed:** keep the document blocked from retrieval, restore Qdrant/file access, and
   retry. Never manually mark it deleted without zero readback.

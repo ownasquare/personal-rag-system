@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from personal_rag import __version__
-from personal_rag.api.routes import chat, documents, health, jobs, status
+from personal_rag.api.routes import chat, conversations, documents, health, jobs, status
 from personal_rag.config import Settings, get_settings
 from personal_rag.container import AppContainer, build_container
 from personal_rag.errors import RagError
@@ -144,6 +144,7 @@ def create_app(
     api.include_router(status.router)
     api.include_router(documents.router)
     api.include_router(jobs.router)
+    api.include_router(conversations.router)
     api.include_router(chat.router)
     application.include_router(api)
 

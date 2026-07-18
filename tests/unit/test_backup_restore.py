@@ -10,6 +10,9 @@ from typing import cast
 
 import pytest
 
+from personal_rag.database import Database
+from personal_rag.models import Citation
+from personal_rag.repository import Repository
 from scripts.backup import create_backup
 from scripts.restore import MAX_UNCOMPRESSED_BYTES, restore_backup, validate_members
 
@@ -36,6 +39,69 @@ def test_backup_and_restore_round_trip(tmp_path: Path) -> None:
     finally:
         restored_connection.close()
     assert (restored / "uploads" / "doc.txt").read_text(encoding="utf-8") == "launch key"
+
+
+def test_backup_and_restore_preserves_conversation_turns(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    repository = Repository(Database(data_dir / "personal_rag.sqlite3"))
+    repository.initialize()
+    receipt = repository.create_document_with_job(
+        document_id="doc-1",
+        display_name="Notes.md",
+        stored_path="doc-1.md",
+        content_type="text/markdown",
+        extension=".md",
+        content_sha256="a" * 64,
+        size_bytes=42,
+        embedding_fingerprint="b" * 64,
+        idempotency_key="backup-conversation-document",
+    )
+    with repository.database.transaction(immediate=True) as connection:
+        connection.execute(
+            """
+            UPDATE documents
+            SET status = 'ready', active_version = 1, chunk_count = 1
+            WHERE id = ?
+            """,
+            (receipt.document.id,),
+        )
+    uploads = data_dir / "uploads"
+    uploads.mkdir()
+    (uploads / "doc-1.md").write_text("Cobalt.", encoding="utf-8")
+    conversation = repository.create_conversation("Atlas")
+    reservation = repository.reserve_conversation_turn(
+        conversation.id,
+        client_turn_id="client-turn-001",
+        question="What is the key?",
+        top_k=5,
+        document_ids=["doc-1"],
+        request_fingerprint="a" * 64,
+    )
+    repository.complete_conversation_turn(
+        reservation.turn.id,
+        reservation_token=reservation.reservation_token or "missing-reservation-token",
+        answer="Cobalt [S1].",
+        citations=[
+            Citation(
+                label="S1",
+                document_id="doc-1",
+                chunk_id="chunk-1",
+                document_name="Notes.md",
+                snippet="Cobalt.",
+            )
+        ],
+        no_answer=False,
+        request_id="request-1",
+    )
+
+    archive = create_backup(data_dir, tmp_path / "backup.tar.gz")
+    restored = restore_backup(archive, tmp_path / "restored")
+    restored_repository = Repository(Database(restored / "personal_rag.sqlite3"))
+
+    turns = restored_repository.list_conversation_turns(conversation.id)
+    assert len(turns) == 1
+    assert turns[0].answer == "Cobalt [S1]."
+    assert turns[0].citations[0].snippet == "Cobalt."
 
 
 def test_backup_refuses_missing_database(tmp_path: Path) -> None:

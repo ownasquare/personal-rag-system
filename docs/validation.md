@@ -1,103 +1,125 @@
 # Validation Evidence
 
-## Release result
+## Phase 2 release result
 
-The 2026-07-17 local deterministic release gate passed for the complete working tree. All tests
-used generated fixtures, fake embedding and answer providers, temporary SQLite state, and local
-Qdrant persistence. No personal document or paid provider call was used.
+The 2026-07-17 Phase 2 local release gate passed for the complete working tree. Tests used
+generated fixtures, deterministic embedding and answer providers, temporary SQLite state, and
+local vector stores. Browser proof used a stateful local FastAPI fixture. No personal document was
+used and no paid model-provider request was made.
 
 ## Automated gates
 
 | Gate | Result |
 |---|---|
-| Dependency lock | Passed; uv resolved 173 packages and uv lock --check exited successfully |
-| Python package build | Passed; source distribution and wheel built successfully from the locked project |
+| Dependency lock | Passed; `uv lock --check` resolved the locked 173-package graph |
+| Python package build | Passed; source distribution and wheel built from the locked project |
+| Ruff format | Passed; 54 files already formatted |
 | Ruff lint | Passed; all checks passed |
-| Ruff format | Passed; 51 files formatted |
-| Strict mypy | Passed; no issues in 28 source files |
-| Bandit | Passed; no findings in src or scripts |
-| Dependency audit | Passed; no known vulnerabilities; the local non-PyPI project package was the only expected skip |
-| Pytest | Passed; 124 deterministic tests; the opt-in live-provider test was deselected |
-| Branch coverage | Passed; 81.19 percent against an 80 percent gate |
-| Compose source parse | Passed; api, qdrant, ui, and worker services were present and the Qdrant host binding stayed on loopback |
-| Repository hygiene | Passed; no unresolved placeholder markers in source, tests, scripts, or configuration; no whitespace errors |
+| Strict mypy | Passed; no issues in 30 source files |
+| Bandit | Passed; no findings in `src` or `scripts` |
+| Dependency audit | Passed; no known vulnerabilities; only the local non-PyPI project package was skipped as expected |
+| Pytest | Passed; 160 deterministic tests; the opt-in live-provider test was deselected |
+| Branch coverage | Passed; 81.85 percent against the 80 percent gate |
+| Compose configuration | Passed with the example environment contract |
+| Container image | Passed; the final Phase 2 application image built successfully |
+| Repository hygiene | Passed; `git diff --check` reported no whitespace errors |
 
 One warning remains in the test environment: FastAPI's TestClient compatibility module emits an
-upstream Starlette deprecation warning about the httpx test adapter. It does not affect runtime
-code and is kept visible rather than suppressed.
+upstream Starlette deprecation warning about the httpx adapter. It does not affect runtime code
+and remains visible rather than being suppressed.
 
-The initial Chroma dependency was removed after the current advisory database reported
-PYSEC-2026-311 with no fixed version. The user-approved Qdrant option was substituted, the lock was
-regenerated, vector behavior was retested, and pip-audit then completed without a vulnerability.
-The remaining Chroma references are historical decision records in documentation only.
+## Phase 2 regression coverage
 
-## Final audit regressions
+The release suite includes focused proof for the new product and safety contracts:
 
-The release audit added focused proofs beyond the original suite:
-
-- A restored database uses portable upload keys; reindex and delete operate only in the restored
-  tree and leave the original source untouched.
-- Production rejects embedded or in-memory Qdrant and missing provider credentials before any
-  collection is created.
-- A profile-changing reindex atomically updates the manifest fingerprint, and a later identical
-  upload deduplicates against the migrated document.
-- Any malformed or out-of-range model citation causes the complete answer to abstain.
-- Qdrant query failures produce sanitized retry-aware 503 errors rather than generic 500s.
-- Backup output inside the application data tree is refused before a recursive copy can start.
-- The required document_id keyword index is created and verified after a simulated interrupted
-  first attempt.
-- Local default tests deselect the paid live test and disable network sockets.
+- SQLite schema v1 migrates forward to v2 without changing existing document or job records.
+- Conversations, turns, and normalized citations survive repository restart and paginate without
+  splitting user/assistant history pairs.
+- A client turn ID is idempotent: a completed duplicate returns persisted truth, an active
+  duplicate is rejected, and edited retry input receives a new identifier.
+- Turn reservations use renewable ownership tokens. A stale provider attempt cannot complete or
+  fail a turn after a newer attempt has recovered the reservation.
+- Completion revalidates cited source state inside the write transaction. Deleted or non-ready
+  sources produce a retryable `source_changed` failure instead of retained stale citations.
+- Source deletion purges cited turns and removes or retitles affected empty conversations in the
+  same metadata transaction.
+- Persisted retryable and expired-pending turns can be retried after a browser refresh.
+- Recent durable jobs are paginated and presented as In progress, Needs attention, or Completed.
+- The deterministic browser fixture advances queued work through running to succeeded, mirrors
+  real active-job conflicts, and purges fixture citation history after completed deletion.
+- Hostile document names remain text in Documents and Activity instead of being interpreted as
+  trusted HTML or Markdown.
 
 ## Deterministic browser proof
 
-The Streamlit interface was exercised in the in-app browser against a temporary FastAPI fixture
-that returned sanitized, deterministic library and citation data.
+The Streamlit interface was exercised in the in-app browser against a temporary local FastAPI
+fixture containing sanitized library, job, conversation, and citation data.
 
 | Viewport | Observed result |
 |---|---|
-| Desktop, 1440 by 1000 | Chat, Library, and Settings and Status rendered and were navigable |
-| Tablet, 768 by 1024 | Cited chat flow rendered with document controls and zero horizontal overflow |
-| Phone, 390 by 844 | All three tabs remained reachable, the cited answer remained readable, and zero horizontal overflow was measured |
+| Desktop, 1440 by 1000 | Ask-first workspace, saved conversation controls, scoped composer, suggestions, and source-backed history rendered without horizontal overflow |
+| Tablet, 768 by 1024 | Ask, Documents, Activity, and System navigation remained reachable and the cited workflow stayed readable |
+| Phone, 390 by 844 | Header compacted to a computed 20.48-pixel title, subtitle collapsed, navigation remained usable, and measured document width stayed exactly 390 pixels |
 
-The chat interaction submitted a question, rendered a grounded answer containing marker S1, and
-showed the matching atlas-launch-notes.md citation. Library showed the ready fixture document.
-Settings and Status showed sanitized model and dependency information. The browser console
-contained zero warnings or errors after the flow. Temporary proof services were stopped.
+The rendered flow also exercised saved conversation reload, cited answer display, failed-document
+reindex handoff, deterministic job progression, and the explicit Activity refresh control. The
+Activity view separated active, failed, and completed work. The semantic heading sequence was
+H1, H2, then H3; no framework exception was present. A new final proof tab reported an empty
+browser log on desktop and mobile. Temporary browser/API/UI proof processes were stopped.
 
-The checked-in Streamlit theme is intentionally a fixed light theme. Dark-mode proof is therefore
-not claimed or required by this release.
+The checked-in Streamlit theme is intentionally fixed light. Dark-mode proof is not claimed.
+
+## Isolated Compose runtime proof
+
+An isolated Compose project was started on disposable loopback ports with generated proof-only
+credentials and a nonfunctional placeholder model key. The final application image and pinned
+`qdrant/qdrant:v1.18.3-unprivileged` service were used.
+
+- API, worker, UI, and Qdrant containers all started.
+- API and UI containers reported healthy.
+- `GET /health/live` returned `alive`.
+- `GET /health/ready` reported metadata, Qdrant, vector inventory, provider configuration, and
+  worker heartbeat ready.
+- Authenticated `GET /api/v1/status` returned an empty ready library and a current worker
+  heartbeat.
+- Streamlit `/_stcore/health` returned `ok`.
+
+This proves local container topology, configuration validation, authentication, storage
+connectivity, worker heartbeat, and health readback. Provider readiness here means configuration
+is present; it does not prove that a real OpenAI or Voyage request succeeds. No document was
+uploaded and no model endpoint was contacted. After proof, the exact containers, network,
+volumes, and temporary environment file were removed, and empty post-teardown inventories were
+verified.
 
 ## Proof boundaries
 
-- Local source, deterministic test, and deterministic browser proof: complete.
-- Docker image build and Compose runtime proof: not run locally because the Docker executable is
-  unavailable. The checked-in CI container job builds the topology and waits for API, worker,
-  vector-inventory, and UI health, but that remote job has not run because this repository has no
-  remote.
-- Live OpenAI or Voyage semantic, quota, latency, privacy, and cost proof: not run. No credential
-  was supplied and no provider credit was spent.
+- Local source, deterministic test, deterministic browser, final image build, and isolated local
+  Compose runtime proof: complete.
+- Live OpenAI or Voyage semantics, quota, latency, privacy, and cost proof: not run. No usable
+  credential was supplied and no provider credit was spent.
 - Hosted-development proof: not run.
 - Production deployment proof: not run.
-- Multi-user, multi-host, and high-availability proof: outside the documented product boundary.
+- Multi-user, multi-host, and high-availability proof: outside the documented single-user product
+  boundary.
 
-## Reproduce the local gate
+## Reproduce the deterministic gate
 
-    uv sync --all-groups --frozen
-    uv lock --check
-    uv run ruff check .
-    uv run ruff format --check .
-    uv run mypy src
-    uv run bandit -q -r src scripts
-    uv run pip-audit
-    uv run pytest -m "not live" --disable-socket --allow-unix-socket --cov --cov-report=term-missing
+```bash
+uv sync --all-groups --frozen
+uv lock --check
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy src
+uv run bandit -q -r src scripts
+uv run pip-audit
+uv run pytest -m "not live" --disable-socket --allow-unix-socket \
+  --cov=personal_rag --cov-report=term-missing --cov-branch -q
+uv build
+docker compose --env-file .env.example config --quiet
+docker compose --env-file .env.example build
+git diff --check
+```
 
-For a Docker-capable host, configure a private env file and then run:
-
-    docker compose config --quiet
-    docker compose build
-    docker compose up -d
-    curl --fail http://127.0.0.1:8000/health/ready
-    curl --fail http://127.0.0.1:8501/_stcore/health
-
-Stop and remove the proof stack after validation. Do not use real personal data for the first
-deployment smoke test.
+For runtime smoke proof, configure a private non-committed environment file, start Compose, read
+back API/UI health and authenticated status, then stop the project with volumes removed. Use
+disposable data for the first deployment smoke test.
