@@ -505,6 +505,40 @@ def test_http_collection_open_retries_connection_and_server_errors(
     assert sleeps == [0.25, 0.5]
 
 
+def test_http_collection_open_retries_concurrent_create_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = make_settings(tmp_path).model_copy(
+        update={"qdrant_mode": "http", "provider_max_retries": 1}
+    )
+    attempts = 0
+    sleeps: list[float] = []
+
+    def concurrently_created(self: VectorStore) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise UnexpectedResponse(
+                status_code=409,
+                reason_phrase="Conflict",
+                content=b"collection already exists",
+                headers=httpx.Headers(),
+            )
+
+    monkeypatch.setattr(VectorStore, "_open_collection", concurrently_created)
+    monkeypatch.setattr("personal_rag.vector_store.time.sleep", sleeps.append)
+    monkeypatch.setattr(
+        vector_store_module,
+        "QdrantVectorStore",
+        lambda **kwargs: object(),
+    )
+
+    VectorStore(settings, client=object())  # type: ignore[arg-type]
+
+    assert attempts == 2
+    assert sleeps == [0.25]
+
+
 def test_http_collection_retries_and_verifies_payload_index_after_partial_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

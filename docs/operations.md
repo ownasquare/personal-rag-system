@@ -83,7 +83,7 @@ Open `http://127.0.0.1:8501`. FastAPI documentation is available at
 
 ### Library search and navigation
 
-- **Apply filters** submits the current filename/type query, status group, and sort together; form
+- **Search** submits the current filename/type query, status group, and sort together; form
   edits do not issue a new search on every keystroke.
 - Status groups are **All**, **Ready**, **Needs attention**, and **Processing**. The latter two map
   to multiple backend states with OR semantics.

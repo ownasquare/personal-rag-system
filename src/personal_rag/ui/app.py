@@ -292,8 +292,22 @@ def _providers_configured(status: SystemStatus | None) -> bool:
 
 
 def _render_setup_notice() -> None:
-    st.warning("Connect a model provider before adding documents or asking questions.")
-    if st.button("Open system status", type="primary"):
+    st.warning("Finish setup before adding documents or asking questions.")
+    if st.button(
+        "Open system status",
+        type="primary",
+        help="Shows which connection or provider needs attention.",
+    ):
+        _request_section("System")
+
+
+def _render_service_recovery() -> None:
+    st.info("Your saved work is safe. Check System status, then try again.")
+    if st.button(
+        "Open system status",
+        key="open-system-recovery",
+        help="Shows the app connection and provider setup without exposing credentials.",
+    ):
         _request_section("System")
 
 
@@ -766,7 +780,7 @@ def _render_ask(client: UiClient, settings: Settings) -> None:
     status, status_error = _safe_status(client)
     if status_error is not None or status is None:
         st.error(status_error.message if status_error is not None else "Status is unavailable.")
-        st.info("Your saved work is untouched. Restore the knowledge service, then refresh.")
+        _render_service_recovery()
         return
     if not _providers_configured(status):
         st.header("Setup required", anchor=False)
@@ -776,7 +790,7 @@ def _render_ask(client: UiClient, settings: Settings) -> None:
     documents, documents_error = _safe_documents(client)
     if documents_error is not None:
         st.error(documents_error.message)
-        st.info("Your saved work is untouched. Restore the knowledge service, then refresh.")
+        _render_service_recovery()
         return
     if not documents:
         _render_onboarding(client, settings)
@@ -1020,9 +1034,7 @@ def _render_documents(client: UiClient, settings: Settings) -> None:
 
     if page_error is not None:
         st.error(page_error.message)
-        st.info(
-            "Your saved documents are untouched. Restore the service, then apply filters again."
-        )
+        _render_service_recovery()
         return
     if page is None:
         return
@@ -1217,7 +1229,7 @@ def _render_system(client: UiClient) -> None:
     ready_state = _health_label(client.health_ready)
     process_column, readiness_column = st.columns(2)
     with process_column, st.container(border=True):
-        st.caption("Knowledge service")
+        st.caption("App connection")
         st.write(live_state.capitalize())
     with readiness_column, st.container(border=True):
         st.caption("Document search")
@@ -1233,7 +1245,7 @@ def _render_system(client: UiClient) -> None:
 
     if not _providers_configured(status):
         st.warning(
-            "Provider setup is incomplete. Configure credentials on the server, then refresh."
+            "Setup is incomplete. Run `python3 scripts/setup.py --check` on the host, then refresh."
         )
 
     st.markdown("### Library overview")
@@ -1271,13 +1283,15 @@ def main() -> None:
         client = _resolve_client()
     except Exception:
         st.markdown(HEADER_HTML, unsafe_allow_html=True)
-        st.error("The library cannot connect because server-side setup is incomplete.")
-        st.info("Configure the service URL and access token, then restart this workspace.")
+        st.error("Personal Library cannot start because setup is incomplete.")
+        st.info("Run `python3 scripts/setup.py --check` on the host, then restart the app.")
         st.stop()
 
     _render_header()
     if settings.demo_mode:
-        st.info("Demo mode · Sample data resets when the demo stops.")
+        st.info(
+            "Demo mode · Processing and answers are simulated. Changes reset when the demo stops."
+        )
     section = _render_navigation()
     if section == "Ask":
         _render_ask(client, settings)

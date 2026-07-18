@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import http.client
+import importlib
 import os
 import subprocess  # nosec B404
 import sys
@@ -11,9 +12,16 @@ import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
-from tests.browser.fake_api import TOKEN as FIXTURE_TOKEN
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    # Direct script execution adds scripts/ rather than the repository root.
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+FIXTURE_TOKEN = cast(
+    str,
+    importlib.import_module("tests.browser.fake_api").TOKEN,
+)
 
 API_HOST = "127.0.0.1"
 API_PORT = 8012
@@ -147,7 +155,6 @@ def stop_process(process: ProcessLike) -> None:
 def run_demo() -> int:
     """Launch both demo services and keep them alive until interrupted."""
 
-    repository_root = Path(__file__).resolve().parents[1]
     api_command, ui_command = build_commands(Path(sys.executable))
     processes: list[subprocess.Popen[bytes]] = []
 
@@ -165,7 +172,7 @@ def run_demo() -> int:
             # Both commands contain only fixed literals and the current Python executable.
             api_process = subprocess.Popen(  # nosec B603
                 api_command,
-                cwd=repository_root,
+                cwd=REPOSITORY_ROOT,
                 env=child_environment,
                 start_new_session=True,
             )
@@ -180,7 +187,7 @@ def run_demo() -> int:
 
             ui_process = subprocess.Popen(  # nosec B603
                 ui_command,
-                cwd=repository_root,
+                cwd=REPOSITORY_ROOT,
                 env=child_environment,
                 start_new_session=True,
             )

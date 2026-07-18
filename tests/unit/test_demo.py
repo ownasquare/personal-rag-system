@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess  # nosec B404
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -7,6 +9,8 @@ import pytest
 
 from scripts import demo
 from tests.browser.fake_api import TOKEN
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_child_environment_is_fixture_scoped_and_removes_provider_keys(
@@ -60,6 +64,20 @@ def test_demo_commands_use_fixed_loopback_ports() -> None:
         "--server.port=8512",
         "--server.headless=true",
     ]
+
+
+def test_demo_script_can_start_from_a_fresh_checkout() -> None:
+    result = subprocess.run(  # nosec B603
+        [sys.executable, "scripts/demo.py", "unexpected-argument"],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.strip() == "This command does not accept arguments."
 
 
 class _FakeProcess:

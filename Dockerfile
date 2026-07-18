@@ -21,7 +21,7 @@ WORKDIR /app
 COPY --chown=rag:rag pyproject.toml uv.lock README.md LICENSE ./
 COPY --chown=rag:rag .streamlit ./.streamlit
 COPY --chown=rag:rag src ./src
-RUN uv sync --frozen --no-dev --no-editable
+RUN uv sync --frozen --no-dev --no-editable --no-cache
 
 USER rag
 EXPOSE 8000 8501

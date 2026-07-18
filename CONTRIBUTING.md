@@ -70,6 +70,17 @@ docker compose --env-file .env.example config --quiet
 hygiene, and the deterministic coverage suite. Run `make test-live` only when you deliberately
 want a paid provider smoke test.
 
+<details>
+<summary>Manual rendered interface check</summary>
+
+1. Start `uv run python scripts/demo.py`; the tour uses only simulated sample behavior.
+2. In responsive browser tools, check 1440 × 1000, 768 × 1024, and 390 × 844.
+3. Exercise Ask, a citation, Library search and selection, Activity refresh, and System status.
+4. Confirm the core action stays visible, there is no horizontal scrolling, and no framework
+   exception appears. Record the viewports and flows in the pull request.
+
+</details>
+
 ## Pull requests
 
 Explain the user-visible outcome, tests run, security/privacy impact, migration or embedding-profile

@@ -357,13 +357,13 @@ class RagApiClient:
         except httpx.TimeoutException as exc:
             raise ApiClientError(
                 code="api_timeout",
-                message="The knowledge service took too long to respond. Please retry.",
+                message="Personal Library took too long to respond. Try again.",
                 retryable=True,
             ) from exc
         except httpx.RequestError as exc:
             raise ApiClientError(
                 code="api_unavailable",
-                message="The knowledge service is unavailable. Check that it is running and retry.",
+                message="Personal Library is not responding. Check System status and try again.",
                 retryable=True,
             ) from exc
 
@@ -395,7 +395,7 @@ class RagApiClient:
     def _invalid_response_error() -> ApiClientError:
         return ApiClientError(
             code="invalid_response",
-            message="The knowledge service returned an unexpected response. Please retry.",
+            message="Personal Library returned an unexpected response. Try again.",
             status_code=502,
             retryable=True,
         )
@@ -405,7 +405,7 @@ class RagApiClient:
         if response.status_code == httpx.codes.UNAUTHORIZED:
             return ApiClientError(
                 code="authentication_failed",
-                message="The knowledge service rejected its server-side credentials.",
+                message="Personal Library could not verify its server connection.",
                 status_code=response.status_code,
                 retryable=False,
             )
@@ -414,9 +414,9 @@ class RagApiClient:
             envelope = ErrorEnvelope.model_validate(response.json())
         except (ValidationError, TypeError, ValueError):
             fallback_message = (
-                "The knowledge service is temporarily unavailable. Please retry."
+                "Personal Library is temporarily unavailable. Try again."
                 if response.status_code >= 500
-                else "The knowledge service could not complete that request."
+                else "Personal Library could not complete that request."
             )
             return ApiClientError(
                 code="api_error",

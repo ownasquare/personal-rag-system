@@ -1,7 +1,7 @@
 # Changelog
 
-This project follows semantic versioning. User-visible changes are recorded here; internal agent
-plans and machine-specific handoffs are intentionally excluded from the public repository.
+This project follows semantic versioning. User-visible changes and important fixes are recorded
+here.
 
 ## 0.2.0 — 2026-07-18
 
@@ -20,7 +20,18 @@ plans and machine-specific handoffs are intentionally excluded from the public r
 - simplified the interface around Add → Process → Ask → Sources;
 - moved system diagnostics, filters, examples, completed jobs, and destructive document actions
   behind secondary disclosures;
+- made document-scoped questions visibly scoped and easy to clear or reset with a new conversation;
+- reduced long libraries to a compact document picker and removed empty-library filter clutter;
+- made the secondary system view return cleanly to the main Ask, Library, and Activity workspace;
+- labeled the no-key tour as simulated and made unsupported demo questions fail honestly;
+- removed the package-manager cache from the runtime image to reduce first-pull size;
 - rewrote the README around a five-minute first answer and honest beta/privacy/cost boundaries.
+
+### Fixed
+
+- made the documented demo command work from a fresh checkout;
+- retried the harmless Qdrant conflict produced when API and worker create a new collection at the
+  same time, while still validating the resulting collection profile.
 
 ## 0.1.0 — 2026-07-17
 

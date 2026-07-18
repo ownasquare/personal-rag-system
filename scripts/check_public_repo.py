@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import shutil
-# The only subprocess below is a fixed, shell-free Git inventory command.
 import subprocess  # nosec B404
 from pathlib import Path
 

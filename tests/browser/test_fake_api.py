@@ -97,6 +97,31 @@ def test_demo_upload_uses_the_shared_markdown_allowlist(
     assert response.json()["document"]["extension"] == ".markdown"
 
 
+def test_demo_unknown_question_is_honestly_bounded(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    conversation = client.post(
+        "/api/v1/conversations",
+        json={"title": None},
+        headers=auth_headers,
+    )
+    turn = client.post(
+        f"/api/v1/conversations/{conversation.json()['id']}/turns",
+        json={
+            "client_turn_id": "demo-unknown-question",
+            "message": "Summarize the file I just uploaded.",
+            "top_k": 5,
+            "document_ids": None,
+        },
+        headers=auth_headers,
+    )
+
+    assert turn.status_code == 200
+    assert turn.json()["no_answer"] is True
+    assert turn.json()["citations"] == []
+    assert "fixed sample answers" in turn.json()["answer"]
+
+
 def test_reindex_progresses_to_ready_across_activity_reads(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:

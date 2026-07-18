@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
+from llama_index.core.schema import BaseNode, NodeRelationship, RelatedNodeInfo, TextNode
 from llama_index.core.vector_stores.types import (
     ExactMatchFilter,
     FilterCondition,
@@ -109,7 +109,7 @@ class VectorStore:
         )
 
     def _open_collection_with_retry(self) -> None:
-        """Bound only HTTP connection/5xx startup races; never retry profile errors."""
+        """Bound HTTP transport, server, and concurrent-create races; never retry profile errors."""
 
         if self.mode != "http":
             self._open_collection()
@@ -242,7 +242,7 @@ class VectorStore:
         if not nodes:
             return
         dimensions = self.settings.embedding_dimensions
-        text_nodes: list[TextNode] = []
+        text_nodes: list[BaseNode] = []
         for node in nodes:
             if len(node.embedding) != dimensions:
                 raise RagError(
@@ -392,10 +392,10 @@ def _scalar_metadata(metadata: Mapping[str, object]) -> dict[str, MetadataScalar
 
 
 def _retryable_qdrant_startup_error(exc: Exception) -> bool:
-    """Limit startup retries to transport failures and server-side responses."""
+    """Limit startup retries to transport, server, and concurrent-create responses."""
 
     if isinstance(exc, UnexpectedResponse):
-        return exc.status_code is not None and exc.status_code >= 500
+        return exc.status_code == 409 or (exc.status_code is not None and exc.status_code >= 500)
     if isinstance(exc, ResponseHandlingException):
         return isinstance(
             exc.source,

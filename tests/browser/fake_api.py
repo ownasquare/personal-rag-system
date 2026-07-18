@@ -369,15 +369,26 @@ def _answer_turn(
 
     turn_id = _next_identifier("turn")
     created_at = NOW + timedelta(minutes=_sequence["turn"])
+    normalized_question = " ".join(body.message.casefold().split())
+    supported_question = "atlas" in normalized_question and (
+        "key" in normalized_question or "color" in normalized_question
+    )
     turn = ConversationTurn(
         id=turn_id,
         conversation_id=conversation_id,
         client_turn_id=body.client_turn_id,
         status=ConversationTurnStatus.COMPLETED,
         question=body.message,
-        answer="The Atlas launch key is cobalt blue [S1].",
-        citations=[ATLAS_CITATION],
-        no_answer=False,
+        answer=(
+            "The Atlas launch key is cobalt blue [S1]."
+            if supported_question
+            else (
+                "This no-key tour uses fixed sample answers. Ask what the Atlas launch key is "
+                "to see a cited answer."
+            )
+        ),
+        citations=[ATLAS_CITATION] if supported_question else [],
+        no_answer=not supported_question,
         top_k=body.top_k,
         document_ids=body.document_ids,
         request_id=f"browser-proof-{turn_id}",

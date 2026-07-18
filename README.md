@@ -12,9 +12,13 @@ answer.
 > and data policies apply. The app binds to local loopback by default; it is private by deployment
 > boundary, not a fully offline system.
 
+![Personal Library Ask workspace with a calm document-first interface](docs/assets/personal-library-overview.png)
+
 ## See it first — no API key
 
-You can explore the complete interface with deterministic sample data and no provider calls:
+You can explore the complete interface with deterministic sample data and no provider calls.
+Document processing and answers are simulated; uploaded files are temporary and are not used for
+real retrieval in this tour:
 
 ```bash
 uv sync --all-groups --frozen

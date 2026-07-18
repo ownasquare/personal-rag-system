@@ -103,7 +103,8 @@ def test_demo_mode_is_clearly_labeled(
     result = app_test.run()
 
     assert "Demo mode" in _visible_text(result)
-    assert "Sample data resets" in _visible_text(result)
+    assert "Processing and answers are simulated" in _visible_text(result)
+    assert "Changes reset" in _visible_text(result)
 
 
 def test_provider_setup_blocks_upload_everywhere(
@@ -125,12 +126,12 @@ def test_provider_setup_blocks_upload_everywhere(
     )
 
     result = app_test.run()
-    assert "Connect a model provider" in _visible_text(result)
+    assert "Finish setup" in _visible_text(result)
     assert not result.file_uploader
     assert _button(result, "Open system status")
 
     result = _navigate(result, "Library")
-    assert "Connect a model provider" in _visible_text(result)
+    assert "Finish setup" in _visible_text(result)
     assert not result.file_uploader
     assert not any(item.label == "Find a document" for item in result.text_input)
 
@@ -247,9 +248,7 @@ def test_system_status_can_return_to_the_already_selected_primary_section(
     _button(result, "System status").click()
     result = result.run()
 
-    navigation = next(
-        widget for widget in result.segmented_control if widget.label == "Workspace"
-    )
+    navigation = next(widget for widget in result.segmented_control if widget.label == "Workspace")
     assert navigation.value is None
     assert "System status" in _visible_text(result)
 
@@ -774,14 +773,15 @@ def test_api_outage_explains_that_saved_work_is_untouched(
 ) -> None:
     fake_client.status_error = ApiClientError(
         code="api_unavailable",
-        message="The knowledge service is unavailable.",
+        message="Personal Library is not responding.",
         retryable=True,
     )
 
     result = app_test.run()
 
-    assert "knowledge service is unavailable" in _visible_text(result)
-    assert "saved work is untouched" in _visible_text(result)
+    assert "Personal Library is not responding" in _visible_text(result)
+    assert "saved work is safe" in _visible_text(result)
+    assert _button(result, "Open system status")
     assert not result.exception
 
 

@@ -87,8 +87,8 @@ client is required, add a real identity/session backend first.
 3. Add the smallest primary navigation entry; diagnostics and rare maintenance belong in secondary
    disclosures.
 4. Add AppTest coverage in `tests/ui/test_app.py`.
-5. Validate desktop and phone layouts against `tests/browser/fake_api.py`, including console health
-   and one real interaction.
+5. Follow the [manual rendered interface check](../CONTRIBUTING.md#validate)
+   against `tests/browser/fake_api.py`, including desktop, tablet, phone, and one real interaction.
 
 ## Add a database migration
 
