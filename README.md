@@ -12,7 +12,7 @@ answer.
 > and data policies apply. The app binds to local loopback by default; it is private by deployment
 > boundary, not a fully offline system.
 
-![Personal Library Ask workspace with a calm document-first interface](docs/assets/personal-library-overview.png)
+![Personal Library Ask workspace with a calm document-first interface](docs/assets/personal-library-overview.jpg)
 
 ## See it first — no API key
 
