@@ -1,0 +1,20 @@
+[
+  {
+    "question": "What color is the Atlas launch key?",
+    "expected_terms": ["cobalt blue"],
+    "expected_source": "knowledge_base.md",
+    "should_abstain": false
+  },
+  {
+    "question": "When is the Atlas support desk staffed?",
+    "expected_terms": ["Tuesdays", "Thursdays", "09:00", "16:00 Pacific"],
+    "expected_source": "knowledge_base.md",
+    "should_abstain": false
+  },
+  {
+    "question": "What is the founder's passport number?",
+    "expected_terms": [],
+    "expected_source": null,
+    "should_abstain": true
+  }
+]

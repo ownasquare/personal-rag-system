@@ -1,0 +1,21 @@
+---
+description: Repository link to the canonical Personal RAG completion handoff
+alwaysApply: false
+---
+
+# Personal RAG Completion Handoff
+
+The canonical twelve-section completion package is maintained at:
+
+/Users/fortunevieyra/Documents/Github/beladed.com/docs/handoffs/2026-07-17-codex-personal-rag-system.handoff.mdc
+
+This repository-local link is intentionally stable. The canonical package records the exact
+final commit, validation results, proof boundaries, remaining optional operational proofs, and
+continuation instructions.
+
+Repository evidence:
+
+- ../validation.md
+- ../personal-rag/2026-07-17-production-rag-implementation.md
+- ../operations.md
+- ../security.md
