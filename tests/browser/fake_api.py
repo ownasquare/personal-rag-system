@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
@@ -23,12 +24,14 @@ from personal_rag.models import (
     DependencyState,
     DocumentList,
     DocumentPublic,
+    DocumentSort,
     DocumentStatus,
     JobKind,
     JobList,
     JobRecord,
     JobStage,
     JobStatus,
+    SortOrder,
     SystemStatus,
     UploadReceipt,
 )
@@ -66,6 +69,40 @@ FAILED_DOCUMENT = DocumentPublic(
     created_at=NOW - timedelta(days=1),
     updated_at=NOW - timedelta(hours=1),
 )
+
+
+def _library_document(index: int) -> DocumentPublic:
+    """Build stable older records so rendered proof spans multiple result pages."""
+
+    statuses = (
+        DocumentStatus.READY,
+        DocumentStatus.QUEUED,
+        DocumentStatus.FAILED,
+        DocumentStatus.DELETION_FAILED,
+    )
+    status = statuses[index % len(statuses)]
+    display_name = "Résumé 100%_plan.md" if index == 3 else f"project-{index:02d}-reference.md"
+    return DocumentPublic(
+        id=f"browser-library-{index:02d}",
+        display_name=display_name,
+        content_type="text/markdown",
+        extension=".md",
+        size_bytes=1024 + index,
+        status=status,
+        active_version=1 if status is DocumentStatus.READY else 0,
+        chunk_count=3 if status is DocumentStatus.READY else 0,
+        error_code=(
+            "fixture_processing_failed"
+            if status in {DocumentStatus.FAILED, DocumentStatus.DELETION_FAILED}
+            else None
+        ),
+        error_message=None,
+        created_at=NOW - timedelta(days=10 + index),
+        updated_at=NOW - timedelta(days=5 + index),
+    )
+
+
+LIBRARY_DOCUMENTS = [_library_document(index) for index in range(1, 15)]
 ATLAS_CITATION = Citation(
     label="S1",
     document_id=READY_DOCUMENT.id,
@@ -79,6 +116,7 @@ ATLAS_CITATION = Citation(
 _documents: dict[str, DocumentPublic] = {
     READY_DOCUMENT.id: READY_DOCUMENT,
     FAILED_DOCUMENT.id: FAILED_DOCUMENT,
+    **{document.id: document for document in LIBRARY_DOCUMENTS},
 }
 _jobs: dict[str, JobRecord] = {
     "browser-job-ready": JobRecord(
@@ -154,15 +192,31 @@ def _next_identifier(kind: str) -> str:
     return f"browser-{kind}-{_sequence[kind]}"
 
 
-def _visible_documents() -> list[DocumentPublic]:
+def _fold_document_text(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _visible_documents(
+    *,
+    sort: DocumentSort = DocumentSort.CREATED,
+    order: SortOrder = SortOrder.DESC,
+) -> list[DocumentPublic]:
+    key = {
+        DocumentSort.CREATED: lambda document: (document.created_at, document.id),
+        DocumentSort.UPDATED: lambda document: (document.updated_at, document.id),
+        DocumentSort.NAME: lambda document: (
+            _fold_document_text(document.display_name),
+            document.id,
+        ),
+    }[sort]
     return sorted(
         (
             document
             for document in _documents.values()
             if document.status is not DocumentStatus.DELETED
         ),
-        key=lambda document: (document.updated_at, document.id),
-        reverse=True,
+        key=key,
+        reverse=order is SortOrder.DESC,
     )
 
 
@@ -402,11 +456,30 @@ def system_status() -> SystemStatus:
 def list_documents(
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
-    document_status: Annotated[DocumentStatus | None, Query(alias="status")] = None,
+    query: Annotated[str | None, Query(alias="q", max_length=200)] = None,
+    statuses: Annotated[list[DocumentStatus] | None, Query(alias="status")] = None,
+    sort: DocumentSort = DocumentSort.CREATED,
+    order: SortOrder = SortOrder.DESC,
 ) -> DocumentList:
-    documents = _visible_documents()
-    if document_status is not None:
-        documents = [document for document in documents if document.status is document_status]
+    documents = _visible_documents(sort=sort, order=order)
+    if query is not None:
+        if any(unicodedata.category(character).startswith("C") for character in query):
+            raise HTTPException(
+                status_code=422,
+                detail="document query contains control characters",
+            )
+        normalized_query = unicodedata.normalize("NFC", query).strip()
+        if normalized_query:
+            folded_query = _fold_document_text(normalized_query)
+            documents = [
+                document
+                for document in documents
+                if folded_query in _fold_document_text(document.display_name)
+                or folded_query in _fold_document_text(document.extension)
+            ]
+    if statuses:
+        accepted = set(statuses)
+        documents = [document for document in documents if document.status in accepted]
     return DocumentList(
         items=documents[offset : offset + limit],
         total=len(documents),

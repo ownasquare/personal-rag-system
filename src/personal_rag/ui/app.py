@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Protocol, cast
 from uuid import uuid4
 
@@ -18,11 +18,14 @@ from personal_rag.models import (
     ConversationTurnCreate,
     ConversationTurnList,
     ConversationTurnStatus,
+    DocumentList,
     DocumentPublic,
+    DocumentSort,
     DocumentStatus,
     JobList,
     JobRecord,
     JobStatus,
+    SortOrder,
     SystemStatus,
     UploadReceipt,
 )
@@ -42,7 +45,31 @@ WORKSPACE_SECTIONS = ("Ask", "Documents", "Activity", "System")
 TERMINAL_JOB_STATUSES = {JobStatus.SUCCEEDED, JobStatus.FAILED}
 MAX_CONVERSATIONS = 2_000
 TURN_WINDOW = 100
-_MARKDOWN_CONTROL = re.compile(r"([\\`*_{}\[\]()#+!|>])")
+DOCUMENT_PAGE_SIZE = 10
+DOCUMENT_QUERY_MAX_CHARACTERS = 200
+_MARKDOWN_CONTROL = re.compile(r"([\\`*_{}\[\]()#+!|><$~])")
+
+DOCUMENT_STATUS_GROUPS: dict[str, tuple[DocumentStatus, ...] | None] = {
+    "All": None,
+    "Ready": (DocumentStatus.READY,),
+    "Needs attention": (DocumentStatus.FAILED, DocumentStatus.DELETION_FAILED),
+    "Processing": (
+        DocumentStatus.QUEUED,
+        DocumentStatus.VALIDATING,
+        DocumentStatus.EXTRACTING,
+        DocumentStatus.CHUNKING,
+        DocumentStatus.EMBEDDING,
+        DocumentStatus.INDEXING,
+        DocumentStatus.REINDEXING,
+        DocumentStatus.DELETING,
+    ),
+}
+DOCUMENT_SORT_OPTIONS: dict[str, tuple[DocumentSort, SortOrder]] = {
+    "Recently added": (DocumentSort.CREATED, SortOrder.DESC),
+    "Recently updated": (DocumentSort.UPDATED, SortOrder.DESC),
+    "Name A-Z": (DocumentSort.NAME, SortOrder.ASC),
+    "Name Z-A": (DocumentSort.NAME, SortOrder.DESC),
+}
 
 
 class UiClient(Protocol):
@@ -55,6 +82,17 @@ class UiClient(Protocol):
     def get_status(self) -> SystemStatus: ...
 
     def list_all_documents(self, *, max_documents: int = 2000) -> list[DocumentPublic]: ...
+
+    def list_documents(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        query: str | None = None,
+        statuses: Sequence[DocumentStatus] | None = None,
+        sort: DocumentSort = DocumentSort.CREATED,
+        order: SortOrder = SortOrder.DESC,
+    ) -> DocumentList: ...
 
     def upload_document(
         self, filename: str, content: bytes, content_type: str
@@ -126,6 +164,14 @@ def _initialize_state() -> None:
     st.session_state.setdefault("turn_error", None)
     st.session_state.setdefault("activity_notice", None)
     st.session_state.setdefault("activity_errors", [])
+    st.session_state.setdefault("document_query", "")
+    st.session_state.setdefault("document_status_filter", "All")
+    st.session_state.setdefault("document_sort", "Recently added")
+    st.session_state.setdefault("document_offset", 0)
+    st.session_state.setdefault("selected_document_id", None)
+    st.session_state.setdefault("document_query_draft", "")
+    st.session_state.setdefault("document_status_draft", "All")
+    st.session_state.setdefault("document_sort_draft", "Recently added")
 
 
 def _apply_requested_section() -> None:
@@ -155,6 +201,31 @@ def _safe_documents(
         return client.list_all_documents(), None
     except ApiClientError as exc:
         return [], exc
+
+
+def _safe_document_page(
+    client: UiClient,
+    *,
+    query: str | None,
+    statuses: Sequence[DocumentStatus] | None,
+    sort: DocumentSort,
+    order: SortOrder,
+    offset: int,
+) -> tuple[DocumentList | None, ApiClientError | None]:
+    try:
+        return (
+            client.list_documents(
+                limit=DOCUMENT_PAGE_SIZE,
+                offset=offset,
+                query=query,
+                statuses=statuses,
+                sort=sort,
+                order=order,
+            ),
+            None,
+        )
+    except ApiClientError as exc:
+        return None, exc
 
 
 def _safe_conversations(
@@ -318,10 +389,13 @@ def _render_onboarding(client: UiClient, settings: Settings) -> None:
         _render_upload(client, settings, key_prefix="onboarding")
 
 
-def _choose_conversation(
-    client: UiClient,
-    conversations: list[ConversationSummary],
-) -> str | None:
+def _reset_pending_turn_state() -> None:
+    st.session_state["pending_client_turn_id"] = None
+    st.session_state["pending_turn_payload"] = None
+    st.session_state["turn_error"] = None
+
+
+def _resolve_conversation_id(conversations: list[ConversationSummary]) -> str | None:
     known_ids = [conversation.id for conversation in conversations]
     selected = st.session_state.get("selected_conversation_id")
     starting_new = bool(st.session_state.get("starting_new_conversation"))
@@ -335,22 +409,39 @@ def _choose_conversation(
         selected = conversations[0].id
         st.session_state["selected_conversation_id"] = selected
 
-    new_column, previous_column = st.columns([1, 2], vertical_alignment="bottom")
-    with new_column:
-        if st.button("New conversation", width="stretch", type="primary"):
-            st.session_state["selected_conversation_id"] = None
-            st.session_state["starting_new_conversation"] = True
-            st.session_state["confirm_delete_conversation"] = False
-            st.session_state["pending_client_turn_id"] = None
-            st.session_state["pending_turn_payload"] = None
-            st.session_state["turn_error"] = None
-            st.session_state.pop("conversation_picker", None)
-            st.rerun()
-    with previous_column:
-        if conversations:
+    selected_value = st.session_state.get("selected_conversation_id")
+    if not isinstance(selected_value, str) or st.session_state.get("starting_new_conversation"):
+        return None
+    return selected_value if selected_value in known_ids else None
+
+
+def _render_saved_conversations(
+    client: UiClient,
+    conversations: list[ConversationSummary],
+    conversation_id: str | None,
+) -> None:
+    known_ids = [conversation.id for conversation in conversations]
+    starting_new = bool(st.session_state.get("starting_new_conversation"))
+    confirm_delete = bool(st.session_state.get("confirm_delete_conversation"))
+
+    with st.expander("Saved conversations", expanded=confirm_delete):
+        if not conversations:
+            st.caption("Your first completed question will appear here.")
+            return
+
+        new_column, previous_column = st.columns([1, 2], vertical_alignment="bottom")
+        with new_column:
+            if st.button("New conversation", width="stretch", type="primary"):
+                st.session_state["selected_conversation_id"] = None
+                st.session_state["starting_new_conversation"] = True
+                st.session_state["confirm_delete_conversation"] = False
+                _reset_pending_turn_state()
+                st.session_state.pop("conversation_picker", None)
+                st.rerun()
+        with previous_column:
             selected_index = None
-            if not starting_new and selected in known_ids:
-                selected_index = known_ids.index(cast("str", selected))
+            if not starting_new and conversation_id in known_ids:
+                selected_index = known_ids.index(conversation_id)
             picked = st.selectbox(
                 "Previous conversations",
                 options=known_ids,
@@ -361,56 +452,56 @@ def _choose_conversation(
                 placeholder="Choose a saved conversation",
                 key="conversation_picker",
             )
-            if picked is not None and (starting_new or picked != selected):
+            if picked is not None and (starting_new or picked != conversation_id):
                 st.session_state["selected_conversation_id"] = picked
                 st.session_state["starting_new_conversation"] = False
                 st.session_state["confirm_delete_conversation"] = False
-                st.session_state["pending_client_turn_id"] = None
-                st.session_state["pending_turn_payload"] = None
-                st.session_state["turn_error"] = None
+                _reset_pending_turn_state()
                 st.rerun()
 
-    selected_value = st.session_state.get("selected_conversation_id")
-    if not isinstance(selected_value, str) or st.session_state.get("starting_new_conversation"):
-        return None
+        if conversation_id is None:
+            st.caption("A fresh conversation is selected.")
+            return
 
-    selected_summary = next(
-        (conversation for conversation in conversations if conversation.id == selected_value),
-        None,
-    )
-    if selected_summary is None:
-        return None
-
-    detail_column, delete_column = st.columns([4, 1], vertical_alignment="center")
-    with detail_column:
-        st.caption(
-            f"Saved conversation · {selected_summary.turn_count} "
-            f"{'question' if selected_summary.turn_count == 1 else 'questions'}"
+        selected_summary = next(
+            (conversation for conversation in conversations if conversation.id == conversation_id),
+            None,
         )
-    with delete_column:
-        if st.button("Delete…", width="stretch"):
-            st.session_state["confirm_delete_conversation"] = True
+        if selected_summary is None:
+            return
 
-    if st.session_state.get("confirm_delete_conversation"):
-        st.warning("Delete this conversation and its saved answers? Your documents stay intact.")
-        confirm, cancel = st.columns(2)
-        with confirm:
-            if st.button("Delete permanently", type="primary", width="stretch"):
-                try:
-                    client.delete_conversation(selected_summary.id)
-                except ApiClientError as exc:
-                    st.error(exc.message)
-                else:
-                    st.session_state["selected_conversation_id"] = None
-                    st.session_state["starting_new_conversation"] = True
-                    st.session_state["confirm_delete_conversation"] = False
-                    st.session_state.pop("conversation_picker", None)
-                    st.rerun()
-        with cancel:
-            if st.button("Keep conversation", width="stretch"):
-                st.session_state["confirm_delete_conversation"] = False
+        detail_column, delete_column = st.columns([4, 1], vertical_alignment="center")
+        with detail_column:
+            st.caption(
+                f"Saved conversation · {selected_summary.turn_count} "
+                f"{'question' if selected_summary.turn_count == 1 else 'questions'}"
+            )
+        with delete_column:
+            if st.button("Delete…", width="stretch"):
+                st.session_state["confirm_delete_conversation"] = True
                 st.rerun()
-    return selected_summary.id
+
+        if st.session_state.get("confirm_delete_conversation"):
+            st.warning(
+                "Delete this conversation and its saved answers? Your documents stay intact."
+            )
+            confirm, cancel = st.columns(2)
+            with confirm:
+                if st.button("Delete permanently", type="primary", width="stretch"):
+                    try:
+                        client.delete_conversation(selected_summary.id)
+                    except ApiClientError as exc:
+                        st.error(exc.message)
+                    else:
+                        st.session_state["selected_conversation_id"] = None
+                        st.session_state["starting_new_conversation"] = True
+                        st.session_state["confirm_delete_conversation"] = False
+                        st.session_state.pop("conversation_picker", None)
+                        st.rerun()
+            with cancel:
+                if st.button("Keep conversation", width="stretch"):
+                    st.session_state["confirm_delete_conversation"] = False
+                    st.rerun()
 
 
 def _render_sources(citations: list[Citation]) -> None:
@@ -481,9 +572,12 @@ def _retry_persisted_turn(client: UiClient, turn: ConversationTurn) -> None:
     st.rerun()
 
 
-def _suggest_question(text: str, *, key: str, draft_key: str) -> None:
+def _suggest_question(text: str, *, key: str, draft_version: int) -> None:
     if st.button(text, key=key, width="stretch"):
-        st.session_state[draft_key] = text
+        next_version = draft_version + 1
+        st.session_state["question_draft_version"] = next_version
+        st.session_state[f"question_draft_{next_version}"] = text
+        _reset_pending_turn_state()
         st.rerun()
 
 
@@ -500,47 +594,9 @@ def _render_question_form(
             st.caption("Your exact question is still here. Choose Ask library to try again.")
 
     st.subheader("Ask a question", anchor=False)
-    st.caption("Choose specific documents, or leave the selection empty to use everything ready.")
     document_names = {document.id: document.display_name for document in ready_documents}
-    selected_document_ids = st.multiselect(
-        "Look in",
-        options=list(document_names),
-        format_func=lambda document_id: document_names[document_id],
-        placeholder="All ready documents",
-        help="Leave empty to search your entire ready library.",
-    )
-    top_k = min(settings.retrieval_top_k, settings.retrieval_max_top_k)
-    with st.expander("Search options"):
-        top_k = st.slider(
-            "Number of passages to consider",
-            min_value=1,
-            max_value=settings.retrieval_max_top_k,
-            value=top_k,
-            help="The default is usually best. Increase this only when answers miss context.",
-        )
-
     draft_version = int(st.session_state["question_draft_version"])
     draft_key = f"question_draft_{draft_version}"
-    st.caption("Not sure where to start?")
-    suggestions = st.columns(3)
-    with suggestions[0]:
-        _suggest_question(
-            "Summarize the main points",
-            key=f"suggest-summary-{draft_version}",
-            draft_key=draft_key,
-        )
-    with suggestions[1]:
-        _suggest_question(
-            "What decisions were made?",
-            key=f"suggest-decisions-{draft_version}",
-            draft_key=draft_key,
-        )
-    with suggestions[2]:
-        _suggest_question(
-            "What should I follow up on?",
-            key=f"suggest-followup-{draft_version}",
-            draft_key=draft_key,
-        )
 
     with st.form("library-question-form", clear_on_submit=False):
         question = st.text_area(
@@ -550,7 +606,46 @@ def _render_question_form(
             max_chars=settings.max_query_characters,
             height=105,
         )
+        top_k = min(settings.retrieval_top_k, settings.retrieval_max_top_k)
+        with st.expander("Where to look"):
+            st.caption("Leave the document selection empty to search everything that is ready.")
+            selected_document_ids = st.multiselect(
+                "Documents",
+                options=list(document_names),
+                format_func=lambda document_id: document_names[document_id],
+                placeholder="All ready documents",
+                key="question_document_scope",
+            )
+            top_k = st.slider(
+                "Number of passages to consider",
+                min_value=1,
+                max_value=settings.retrieval_max_top_k,
+                value=top_k,
+                help="The default is usually best. Increase this only when answers miss context.",
+                key="question_top_k",
+            )
         submitted = st.form_submit_button("Ask library", type="primary", width="stretch")
+
+    st.caption("Not sure where to start?")
+    suggestions = st.columns(3)
+    with suggestions[0]:
+        _suggest_question(
+            "Summarize the main points",
+            key=f"suggest-summary-{draft_version}",
+            draft_version=draft_version,
+        )
+    with suggestions[1]:
+        _suggest_question(
+            "What decisions were made?",
+            key=f"suggest-decisions-{draft_version}",
+            draft_version=draft_version,
+        )
+    with suggestions[2]:
+        _suggest_question(
+            "What should I follow up on?",
+            key=f"suggest-followup-{draft_version}",
+            draft_version=draft_version,
+        )
 
     if not submitted:
         return
@@ -655,18 +750,25 @@ def _render_ask(client: UiClient, settings: Settings) -> None:
         return
     conversations = conversation_page.items if conversation_page is not None else []
     if conversation_page is not None and len(conversations) < conversation_page.total:
-        st.caption(
+        saved_conversation_note = (
             f"Showing the {len(conversations)} most recent of "
             f"{conversation_page.total} saved conversations."
         )
-    conversation_id = _choose_conversation(client, conversations)
+    else:
+        saved_conversation_note = None
+    conversation_id = _resolve_conversation_id(conversations)
+    selected_summary = next(
+        (conversation for conversation in conversations if conversation.id == conversation_id),
+        None,
+    )
 
     if conversation_id is None:
-        st.subheader("A fresh conversation", anchor=False)
-        st.caption("Your first question will give this conversation a useful title.")
+        st.caption("New conversation · Your first question will become its title.")
         turns_page = None
         turns_error = None
     else:
+        if selected_summary is not None:
+            st.markdown(f"**Current conversation**  \n{_escape_markdown(selected_summary.title)}")
         turns_page, turns_error = _safe_turns(client, conversation_id)
 
     _render_question_form(
@@ -675,6 +777,9 @@ def _render_ask(client: UiClient, settings: Settings) -> None:
         ready_documents,
         conversation_id,
     )
+    _render_saved_conversations(client, conversations, conversation_id)
+    if saved_conversation_note is not None:
+        st.caption(saved_conversation_note)
     if turns_error is not None:
         st.error(turns_error.message)
     elif turns_page is not None:
@@ -709,98 +814,221 @@ def _run_document_action(
     _request_section("Activity")
 
 
+def _apply_document_filters() -> None:
+    status_label = str(st.session_state["document_status_draft"])
+    sort_label = str(st.session_state["document_sort_draft"])
+    st.session_state["document_query"] = str(st.session_state["document_query_draft"]).strip()
+    st.session_state["document_status_filter"] = (
+        status_label if status_label in DOCUMENT_STATUS_GROUPS else "All"
+    )
+    st.session_state["document_sort"] = (
+        sort_label if sort_label in DOCUMENT_SORT_OPTIONS else "Recently added"
+    )
+    st.session_state["document_offset"] = 0
+    st.session_state["selected_document_id"] = None
+
+
+def _render_document_filters() -> None:
+    status_labels = list(DOCUMENT_STATUS_GROUPS)
+    sort_labels = list(DOCUMENT_SORT_OPTIONS)
+    with st.form("document-filter-form"):
+        search_column, status_column, sort_column = st.columns([2, 1, 1])
+        with search_column:
+            st.text_input(
+                "Find a document",
+                placeholder="Search filenames and file types",
+                max_chars=DOCUMENT_QUERY_MAX_CHARACTERS,
+                key="document_query_draft",
+            )
+        with status_column:
+            st.selectbox(
+                "Status",
+                options=status_labels,
+                key="document_status_draft",
+            )
+        with sort_column:
+            st.selectbox(
+                "Sort by",
+                options=sort_labels,
+                key="document_sort_draft",
+            )
+        st.form_submit_button(
+            "Apply filters",
+            type="primary",
+            on_click=_apply_document_filters,
+        )
+
+
+def _render_document_detail(client: UiClient, document: DocumentPublic) -> None:
+    status_label = document_status_label(document.status)
+    st.subheader(_escape_markdown(document.display_name), anchor=False)
+    st.caption(
+        f"{status_label} · {document.extension.removeprefix('.').upper()} · "
+        f"{format_bytes(document.size_bytes)} · Updated {document.updated_at:%b %d, %Y}"
+    )
+    if document.status is DocumentStatus.READY:
+        st.write(f"Ready across {document.chunk_count} searchable passages.")
+    elif document.status is DocumentStatus.DELETION_FAILED:
+        st.warning("Removal is incomplete. Restore storage access and retry below.")
+    elif document.status is DocumentStatus.FAILED:
+        st.warning("This document needs attention before it can be used in answers.")
+    else:
+        st.info("This document is still being prepared.")
+
+    with st.expander("Technical details"):
+        st.caption(
+            f"Content type: {document.content_type} · "
+            f"Version: {document.active_version} · "
+            f"Passages: {document.chunk_count}"
+        )
+        if document.error_code:
+            st.caption(f"Error code: {document.error_code}")
+
+    can_refresh = document.status in {DocumentStatus.READY, DocumentStatus.FAILED}
+    if st.button(
+        "Refresh document",
+        key=f"refresh-document-{document.id}",
+        disabled=not can_refresh,
+    ):
+        _run_document_action(client.reindex_document, document=document)
+
+    st.markdown("**Remove document**")
+    st.caption("This removes the stored file, its search index, and saved answers that cite it.")
+    confirmation = st.text_input(
+        f'Type "{document.display_name}" to confirm removal',
+        key=f"delete-confirm-{document.id}",
+    )
+    delete_label = (
+        f"Retry removal of {document.display_name}"
+        if document.status is DocumentStatus.DELETION_FAILED
+        else f"Remove {document.display_name} permanently"
+    )
+    if st.button(
+        delete_label,
+        key=f"delete-document-{document.id}",
+        disabled=confirmation != document.display_name,
+    ):
+        _run_document_action(client.delete_document, document=document)
+
+
 def _render_documents(client: UiClient, settings: Settings) -> None:
     st.markdown('<div class="section-kicker">Documents</div>', unsafe_allow_html=True)
     st.header("Documents", anchor=False)
-    with st.container(border=True):
-        _render_upload(client, settings, key_prefix="documents", heading="Add documents")
-
-    documents, documents_error = _safe_documents(client)
     st.subheader("Your library", anchor=False)
-    search = st.text_input(
-        "Find a document",
-        placeholder="Search by filename, type, or state",
-        help="Searches the bounded library records already returned by the service.",
+
+    query = str(st.session_state["document_query"]).strip()
+    status_label = str(st.session_state["document_status_filter"])
+    sort_label = str(st.session_state["document_sort"])
+    if status_label not in DOCUMENT_STATUS_GROUPS:
+        status_label = "All"
+        st.session_state["document_status_filter"] = status_label
+    if sort_label not in DOCUMENT_SORT_OPTIONS:
+        sort_label = "Recently added"
+        st.session_state["document_sort"] = sort_label
+    statuses = DOCUMENT_STATUS_GROUPS[status_label]
+    sort, order = DOCUMENT_SORT_OPTIONS[sort_label]
+    offset = max(0, int(st.session_state["document_offset"]))
+
+    page, page_error = _safe_document_page(
+        client,
+        query=query or None,
+        statuses=statuses,
+        sort=sort,
+        order=order,
+        offset=offset,
     )
-    if documents_error is not None:
-        st.error(documents_error.message)
+    has_filters = bool(query) or status_label != "All"
+    library_is_empty = page is not None and page.total == 0 and not has_filters
+    if library_is_empty:
+        with st.expander("Add documents", expanded=True):
+            _render_upload(client, settings, key_prefix="documents")
+
+    _render_document_filters()
+    if page_error is not None:
+        st.error(page_error.message)
+        st.info(
+            "Your saved documents are untouched. Restore the service, then apply filters again."
+        )
         return
-    if not documents:
-        st.info("Your library is empty. Add a document above to begin.")
+    if page is None:
+        return
+    if page.total > 0 and offset >= page.total:
+        st.session_state["document_offset"] = ((page.total - 1) // DOCUMENT_PAGE_SIZE) * (
+            DOCUMENT_PAGE_SIZE
+        )
+        st.session_state["selected_document_id"] = None
+        st.rerun()
+    if page.total > 0 and not page.items:
+        st.session_state["selected_document_id"] = None
+        if page.offset > 0:
+            st.session_state["document_offset"] = max(
+                0,
+                page.offset - DOCUMENT_PAGE_SIZE,
+            )
+            st.rerun()
+        st.info("Your library changed while this page was loading. Refresh to see the latest list.")
+        if st.button("Refresh library", type="primary"):
+            st.rerun()
+        return
+    if page.total == 0:
+        if has_filters:
+            st.info("No documents match the applied filters.")
+            with st.expander("Add documents", expanded=False):
+                _render_upload(client, settings, key_prefix="documents")
+        else:
+            st.info("Your library is empty. Add a document to begin.")
         return
 
-    query = search.casefold().strip()
-    filtered = [
-        document
-        for document in documents
-        if not query
-        or query
-        in " ".join(
-            (
-                document.display_name,
-                document.extension,
-                document_status_label(document.status),
-            )
-        ).casefold()
-    ]
-    st.caption(f"{len(filtered)} of {len(documents)} documents")
-    if not filtered:
-        st.info("No documents match that search.")
-        return
+    first_position = page.offset + 1
+    last_position = page.offset + len(page.items)
+    st.caption(f"Showing {first_position}-{last_position} of {page.total} documents")
 
-    for document in filtered:
-        status_label = document_status_label(document.status)
-        with st.expander(f"{document.display_name} — {status_label}"):
-            st.caption(
-                f"{document.extension.removeprefix('.').upper()} · "
-                f"{format_bytes(document.size_bytes)} · "
-                f"Updated {document.updated_at:%b %d, %Y}"
-            )
-            if document.status is DocumentStatus.READY:
-                st.write(f"Ready across {document.chunk_count} searchable passages.")
-            elif document.status is DocumentStatus.DELETION_FAILED:
-                st.warning("Removal is incomplete. Restore storage access and retry below.")
-            elif document.status is DocumentStatus.FAILED:
-                st.warning("This document needs attention before it can be used in answers.")
-            else:
-                st.info("This document is still being prepared.")
+    visible_ids = [document.id for document in page.items]
+    selected_id = st.session_state.get("selected_document_id")
+    if selected_id not in visible_ids:
+        selected_id = visible_ids[0]
+        st.session_state["selected_document_id"] = selected_id
+    document_names = {document.id: document.display_name for document in page.items}
+    document_states = {
+        document.id: document_status_label(document.status) for document in page.items
+    }
 
-            with st.expander("Technical details"):
-                st.caption(
-                    f"Content type: {document.content_type} · "
-                    f"Version: {document.active_version} · "
-                    f"Passages: {document.chunk_count}"
-                )
-                if document.error_code:
-                    st.caption(f"Error code: {document.error_code}")
+    list_column, detail_column = st.columns([2, 3], vertical_alignment="top")
+    with list_column:
+        st.caption("Choose a document · details appear alongside or below")
+        selected_id = st.radio(
+            "Documents on this page",
+            options=visible_ids,
+            format_func=lambda document_id: (
+                f"{document_names[document_id]} — {document_states[document_id]}"
+            ),
+            key="selected_document_id",
+            label_visibility="collapsed",
+        )
+    selected_document = next(document for document in page.items if document.id == selected_id)
+    with detail_column, st.container(border=True):
+        _render_document_detail(client, selected_document)
 
-            can_refresh = document.status in {DocumentStatus.READY, DocumentStatus.FAILED}
-            if st.button(
-                "Refresh document",
-                key=f"refresh-document-{document.id}",
-                disabled=not can_refresh,
-            ):
-                _run_document_action(client.reindex_document, document=document)
+    previous_column, page_column, next_column = st.columns([1, 2, 1])
+    with previous_column:
+        if st.button("Previous page", disabled=page.offset == 0, width="stretch"):
+            st.session_state["document_offset"] = max(0, page.offset - DOCUMENT_PAGE_SIZE)
+            st.rerun()
+    with page_column:
+        current_page = page.offset // DOCUMENT_PAGE_SIZE + 1
+        page_count = (page.total + DOCUMENT_PAGE_SIZE - 1) // DOCUMENT_PAGE_SIZE
+        st.caption(f"Page {current_page} of {page_count}")
+    with next_column:
+        if st.button(
+            "Next page",
+            disabled=page.offset + len(page.items) >= page.total,
+            width="stretch",
+        ):
+            st.session_state["document_offset"] = page.offset + DOCUMENT_PAGE_SIZE
+            st.rerun()
 
-            st.markdown("**Remove document**")
-            st.caption(
-                "This removes the stored file, its search index, and saved answers that cite it."
-            )
-            confirmation = st.text_input(
-                f'Type "{document.display_name}" to confirm removal',
-                key=f"delete-confirm-{document.id}",
-            )
-            delete_label = (
-                f"Retry removal of {document.display_name}"
-                if document.status is DocumentStatus.DELETION_FAILED
-                else f"Remove {document.display_name} permanently"
-            )
-            if st.button(
-                delete_label,
-                key=f"delete-document-{document.id}",
-                disabled=confirmation != document.display_name,
-            ):
-                _run_document_action(client.delete_document, document=document)
+    with st.expander("Add documents", expanded=False):
+        _render_upload(client, settings, key_prefix="documents")
 
 
 def _activity_document_name(

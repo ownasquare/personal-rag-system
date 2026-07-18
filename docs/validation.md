@@ -1,13 +1,94 @@
 # Validation Evidence
 
-## Phase 2 release result
+## 2026-07-18 library-findability Phase 2 release result
+
+The complete local working tree passed the deterministic release gate using generated fixtures,
+temporary SQLite state, local vector stores, and a stateful no-network FastAPI browser fixture. No
+personal document was used and no paid model-provider request was made.
+
+### Current automated gates
+
+| Gate | Result |
+|---|---|
+| Dependency lock | Passed; `uv lock --check` resolved the locked 173-package graph |
+| Python package build | Passed; source distribution and wheel built from the locked project |
+| Ruff format | Passed after formatting the two changed browser-fixture files; 54 files are in canonical format |
+| Ruff lint | Passed; all checks passed |
+| Strict mypy | Passed; no issues in 30 source files |
+| Bandit | Passed; no findings in `src` or `scripts` |
+| Dependency audit | Passed; no known vulnerabilities; only the local non-PyPI project package was skipped as expected |
+| Pytest | Passed; 200 deterministic tests; one opt-in live-provider test deselected |
+| Branch coverage | Passed; 82.46 percent against the 80 percent gate |
+| Compose configuration | Passed with the example environment contract |
+| Container image | Passed; the application image rebuilt successfully from the current source |
+| Repository hygiene | Passed; `git diff --check` reported no whitespace errors |
+
+One visible test warning remains: FastAPI's compatibility `TestClient` emits an upstream Starlette
+deprecation warning about the httpx adapter. It does not affect runtime code and is not suppressed.
+
+### Current regression coverage
+
+- Repository tests seed 30 documents and prove literal Unicode matching, literal percent and
+  underscore handling, extension matching, OR status groups, deleted exclusion, exact filtered
+  counts, and complete stable page boundaries for all six sort/order pairs.
+- API tests prove default and single-status compatibility, repeatable statuses, filtered totals,
+  sanitized invalid query/enum handling, and rejection of leading controls, format characters,
+  private-use characters, and overlong input.
+- Client tests assert exact encoding of repeated status parameters and fixed sort/order values
+  while preserving the legacy default request shape.
+- Streamlit AppTests prove one-page requests, one selected action panel, one-request filter submit,
+  page/filter reset, concurrent empty-boundary-page recovery, typed deletion, hostile-name
+  escaping, and non-empty-library upload de-emphasis.
+- Ask AppTests prove composer-before-suggestions ordering, widget-safe suggestion seeding through a
+  new draft key, secondary saved-conversation management, and durable retry/delete behavior.
+- The browser fixture contains 16 documents and mirrors literal search, repeated statuses, Unicode
+  normalization, fixed sort, exact totals, paging, and separate-field matching.
+
+### Current deterministic browser proof
+
+The Streamlit interface was exercised in the in-app browser against the stateful local fixture.
+
+| Viewport | Observed result |
+|---|---|
+| Desktop, 1440 by 1000 | Library filters and first-page selection were visible together; the two-column master/detail remained calm and readable |
+| Tablet, 768 by 1024 | Filters, selection list, and selected detail remained readable with measured document width exactly 768 pixels |
+| Phone, 390 by 844 | Search controls and a complete first document row fit in the first viewport; Ask showed the question field and primary action in the first viewport; measured width stayed exactly 390 pixels |
+
+The rendered flow applied the literal `Résumé 100%_` query with **Needs attention** and **Name
+A-Z**, verified the exact one-result total, moved to page two and selected another document, opened
+the secondary upload control, seeded a suggested question without widget-state failure, and opened
+saved-conversation controls. The document heading was verified after eliminating a stale generated
+anchor. Semantic H1/H2/H3 structure and visible text status labels remained present, horizontal
+overflow was absent at all three widths, and a fresh final tab reported an empty browser log. The
+temporary browser, API, and UI processes were stopped. The fixed light theme remains intentional;
+dark-mode proof is not claimed.
+
+### Current isolated Compose runtime proof
+
+The rebuilt image was started as a disposable four-service Compose project on isolated loopback
+ports with proof-only credentials and a nonfunctional placeholder provider key.
+
+- API, worker, Streamlit, and pinned `qdrant/qdrant:v1.18.3-unprivileged` containers all ran.
+- API and UI health checks reported healthy.
+- `GET /health/ready` reported metadata, Qdrant, vector inventory, provider configuration, and
+  worker heartbeat ready without making a paid call.
+- Streamlit `/_stcore/health` returned `ok`.
+- An authenticated document request with literal query, repeated statuses, name sort, order,
+  limit, and offset returned the correct empty `DocumentList` contract.
+- The exact proof containers, network, volumes, and ignored environment file were removed.
+
+This proves the current local container topology and readback boundary. It does not prove a real
+OpenAI/Voyage request, provider quota or cost, hosted development, production deployment, or
+multi-user/high-availability behavior.
+
+## Historical evidence — 2026-07-17 product-experience Phase 2
 
 The 2026-07-17 Phase 2 local release gate passed for the complete working tree. Tests used
 generated fixtures, deterministic embedding and answer providers, temporary SQLite state, and
 local vector stores. Browser proof used a stateful local FastAPI fixture. No personal document was
 used and no paid model-provider request was made.
 
-## Automated gates
+### Historical automated gates
 
 | Gate | Result |
 |---|---|
@@ -28,7 +109,7 @@ One warning remains in the test environment: FastAPI's TestClient compatibility 
 upstream Starlette deprecation warning about the httpx adapter. It does not affect runtime code
 and remains visible rather than being suppressed.
 
-## Phase 2 regression coverage
+### Historical Phase 2 regression coverage
 
 The release suite includes focused proof for the new product and safety contracts:
 
@@ -50,7 +131,7 @@ The release suite includes focused proof for the new product and safety contract
 - Hostile document names remain text in Documents and Activity instead of being interpreted as
   trusted HTML or Markdown.
 
-## Deterministic browser proof
+### Historical deterministic browser proof
 
 The Streamlit interface was exercised in the in-app browser against a temporary local FastAPI
 fixture containing sanitized library, job, conversation, and citation data.
@@ -69,7 +150,7 @@ browser log on desktop and mobile. Temporary browser/API/UI proof processes were
 
 The checked-in Streamlit theme is intentionally fixed light. Dark-mode proof is not claimed.
 
-## Isolated Compose runtime proof
+### Historical isolated Compose runtime proof
 
 An isolated Compose project was started on disposable loopback ports with generated proof-only
 credentials and a nonfunctional placeholder model key. The final application image and pinned
@@ -91,7 +172,7 @@ uploaded and no model endpoint was contacted. After proof, the exact containers,
 volumes, and temporary environment file were removed, and empty post-teardown inventories were
 verified.
 
-## Proof boundaries
+### Historical proof boundaries
 
 - Local source, deterministic test, deterministic browser, final image build, and isolated local
   Compose runtime proof: complete.

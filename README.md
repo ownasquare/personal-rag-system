@@ -20,6 +20,8 @@ Compose topology.
 - Persistent Qdrant vector storage with immutable embedding-profile checks
 - SQLite WAL manifest with durable ingest/reindex/delete jobs and saved cited conversations
 - Separate worker with atomic leases, heartbeat, bounded retries, and crash reclamation
+- Server-side literal filename/type search, OR status filters, deterministic sorting, and
+  paginated single-document management
 - PDF, DOCX, Markdown, and text parsing with page/section citation metadata
 - SHA-256 deduplication and optional request idempotency keys
 - Source-grounded answers, low-support abstention, and citation-marker validation
@@ -121,13 +123,17 @@ reindex; vectors with different dimensions are never mixed in one collection. Fo
 2. Follow durable progress in **Activity**. Jobs are restored from the API after a refresh or a
    closed browser; newly accepted work appears there immediately. Choose **Refresh** when you want
    the latest state—terminal activity does not create a permanent background polling loop.
-3. Ask a question and open **Sources** to read the filename, page or section, and exact supporting
-   passage. Retrieval scoring stays out of the normal reading experience.
-4. Start a new conversation or reopen a saved one. Completed, pending, and failed turn truth is
-   stored by the API. Saved pending and retryable turns expose a one-click retry, while an edited
-   question receives a new client turn ID so idempotency remains correct.
-5. Use **Documents** to search the current bounded library, refresh a failed or stale document, or
-   confirm permanent removal. A successful source deletion also removes saved turns that cite it.
+3. Ask from the question-first composer, optionally narrow **Where to look**, then open **Sources**
+   to read the filename, page or section, and exact supporting passage. Suggestions follow the
+   primary action, while retrieval scoring stays out of the normal reading experience.
+4. Reopen or remove saved conversations from the secondary **Saved conversations** disclosure.
+   Completed, pending, and failed turn truth is stored by the API. Saved pending and retryable
+   turns expose a one-click retry, while an edited question receives a new client turn ID so
+   idempotency remains correct.
+5. Use **Documents** to search filenames and file types on the server, combine user-facing status
+   groups, choose a deterministic sort, and move through ten-item pages. Select one document to
+   inspect or act on it; adding more files stays secondary when the library is non-empty. A
+   successful source deletion also removes saved turns that cite it.
 6. Open **System** only for sanitized setup and dependency details. Keys and storage paths are
    never displayed.
 
@@ -139,7 +145,7 @@ All `/api/v1/*` routes use `Authorization: Bearer <RAG_API_KEY>` when auth is en
 |---|---|
 | Liveness / readiness | `GET /health/live`, `GET /health/ready` |
 | Sanitized status | `GET /api/v1/status` |
-| Upload / list | `POST`, `GET /api/v1/documents` |
+| Upload / searchable, filterable, sortable list | `POST`, `GET /api/v1/documents` |
 | Document detail | `GET /api/v1/documents/{id}` |
 | Reindex | `POST /api/v1/documents/{id}/reindex` |
 | Verified deletion | `DELETE /api/v1/documents/{id}` |
@@ -190,8 +196,10 @@ identity-aware access layer such as OIDC. Do not publish Qdrant.
 - [Validation evidence and proof boundaries](docs/validation.md)
 - [Implementation completion record](docs/personal-rag/2026-07-17-production-rag-implementation.md)
 - [Phase 2 completion record](docs/personal-rag/2026-07-17-product-experience-phase-2.md)
+- [Library findability Phase 2 completion record](docs/personal-rag/2026-07-18-library-findability-phase-2.md)
 - [Implementation plan](docs/superpowers/plans/2026-07-17-personal-rag-system.md)
 - [Phase 2 product-experience plan](docs/superpowers/plans/2026-07-17-personal-rag-product-experience-phase-2.md)
+- [Library findability Phase 2 plan](docs/superpowers/plans/2026-07-18-personal-library-findability-phase-2.md)
 
 ## Honest limitations
 
@@ -200,8 +208,10 @@ identity-aware access layer such as OIDC. Do not publish Qdrant.
   indexing empty content.
 - Completed conversation turns are durable. An unsubmitted text-area draft remains browser-session
   state; retryable submitted turns retain their server reservation and safe failure state.
-- Document search is intentionally bounded to records loaded by the single-user UI. Server-side
-  full-text library search, tags, collections, and renaming are deferred.
+- Library search covers display name and extension metadata only. It does not search document
+  bodies, snippets, or vectors; tags, collections, and renaming are deferred.
+- The optional Ask document picker still loads at most 2,000 ready-document choices. Library
+  browsing itself uses truthful server-side pagination and is not limited by that picker.
 - Compose backup requires both application and Qdrant volumes to be snapshotted in one stopped
   window. The local backup script cannot snapshot a separate container volume.
 - Live provider behavior, cost, quota, and privacy remain account/provider concerns and are kept

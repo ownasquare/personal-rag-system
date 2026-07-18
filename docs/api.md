@@ -27,7 +27,8 @@ including streaming requests without Content-Length. Stateless chat history and 
 conversation history are capped by both schema and runtime configuration; the absolute schema
 ceiling is 100 messages. The configurable upload
 limit can be lowered from the shared 25 MiB UI/API ceiling, and the query limit can be lowered
-from the 4,000-character schema ceiling.
+from the 4,000-character RAG-question schema ceiling. Document-metadata search has a separate,
+fixed 200-character ceiling.
 
 ## Unprotected operational endpoints
 
@@ -103,6 +104,33 @@ URL-safe characters.
 | `DELETE` | `/api/v1/documents/{document_id}` | `202` durable verified-deletion job |
 | `GET` | `/api/v1/jobs?limit=50&offset=0&status=running&document_id=...` | Paginated durable activity |
 | `GET` | `/api/v1/jobs/{job_id}` | Durable stage/progress/error readback |
+
+#### Document listing contract
+
+`GET /api/v1/documents` accepts:
+
+- `q`: optional literal search text, at most 200 characters. It is trimmed and matched with a
+  deterministic Unicode normalization/casefold against `display_name` and `extension` only.
+  Percent and underscore characters have no wildcard meaning. Unsupported control, format, and
+  other Unicode control-category characters return a sanitized `invalid_document_query` `422`.
+- `status`: optional and repeatable. Multiple values use OR semantics; the existing single
+  `status=ready` form remains compatible. Values are validated `DocumentStatus` enums.
+- `sort`: `created`, `updated`, or `name`; default `created`.
+- `order`: `asc` or `desc`; default `desc`.
+- `limit`: 1-100; default 50. `offset` is non-negative; default 0.
+
+For example:
+
+```http
+GET /api/v1/documents?q=plan%25_&status=failed&status=deletion_failed&sort=name&order=asc&limit=10&offset=0
+```
+
+`total` applies the same query and status predicates before paging. Sort ties use document ID, so
+page boundaries are stable while the underlying library is unchanged. List items and totals are
+separate reads and may briefly reflect a concurrent add or removal; the UI safely clamps or
+refreshes an empty boundary page. Deleted records never appear. Metadata search reads SQLite only:
+it does not inspect file bodies, stored paths, snippets, chunks, embeddings, Qdrant, or a model
+provider.
 
 Deletion is idempotent. A document in `deleting` state is excluded from ordinary retrieval; it is
 not reported `deleted` until Qdrant and retained-file readback succeed.

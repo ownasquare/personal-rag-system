@@ -67,6 +67,19 @@ requires a separate API key.
 - Low-support questions abstain. The service does not present a plausible unsupported answer as
   grounded.
 
+## Library metadata-search controls
+
+- Search text is capped at 200 characters. Unicode control/format and other control-category
+  characters are rejected before trimming, preventing hidden input from bypassing validation.
+- SQLite matching is parameterized and uses literal `instr` comparisons; percent and underscore
+  characters never become SQL wildcards.
+- Sort and order are validated enums mapped to fixed SQL fragments, so user input never enters an
+  `ORDER BY` expression. Repeated status values are validated, deduplicated enums.
+- Search returns only the existing sanitized `DocumentPublic` model and excludes deleted records.
+  It never reads stored paths, source bytes, chunks, snippets, embeddings, Qdrant, or providers.
+- Hostile filenames remain text in radio labels, detail headings, activity rows, and removal
+  controls; Markdown-significant punctuation is escaped wherever a Markdown renderer is used.
+
 ## Logging and errors
 
 Structured HTTP logs include service, route template, status, duration, and request ID. Worker
@@ -75,6 +88,11 @@ relevant. They intentionally exclude document text, snippets, embeddings, questi
 original filenames, bearer tokens, provider keys, and raw exception responses from providers.
 API errors return a stable code, safe message, retryability, and request ID; production responses
 never expose stack traces or filesystem paths.
+
+The metadata query `q` is an HTTP URL parameter. The checked-in Docker command and `make api`
+disable Uvicorn access logs, while application logs record only route templates. A separately
+installed reverse proxy or API gateway may still retain full URLs unless query-string redaction is
+configured; treat that as part of the deployment review.
 
 ## Provider privacy
 
@@ -106,9 +124,10 @@ archive's temporary tree from recursively entering the upload or vector copy sou
 ## Security validation
 
 The deterministic quality gate includes Ruff security rules, Bandit, dependency audit, hostile
-filename/content tests, request-limit and auth tests, prompt-injection fixtures, sanitized error
-tests, deletion readback, and network-disabled default tests. Live-provider tests are opt-in and
-must not print provider responses containing user content.
+filename/content tests, request-limit and auth tests, literal percent/underscore and Unicode
+metadata queries, invalid-query and invalid-enum sanitization, deleted-record exclusion, fixed-sort
+coverage, prompt-injection fixtures, deletion readback, and network-disabled default tests.
+Live-provider tests are opt-in and must not print provider responses containing user content.
 
 For multi-host Qdrant, add TLS or use Qdrant Cloud/private-cloud controls. The included plaintext
 Qdrant connection is limited to the private single-host Compose bridge and is not a public-network

@@ -46,7 +46,7 @@ security:
 check: lint typecheck security coverage
 
 api:
-	uv run uvicorn personal_rag.api.app:app --host 127.0.0.1 --port 8000 --workers 1
+	uv run uvicorn personal_rag.api.app:app --host 127.0.0.1 --port 8000 --workers 1 --no-access-log
 
 worker:
 	uv run python -m personal_rag.worker

@@ -9,7 +9,14 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from personal_rag.models import ChatRequest, ConversationTurnCreate, JobStatus
+from personal_rag.models import (
+    ChatRequest,
+    ConversationTurnCreate,
+    DocumentSort,
+    DocumentStatus,
+    JobStatus,
+    SortOrder,
+)
 from personal_rag.ui.client import ApiClientError, RagApiClient
 
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=UTC).isoformat()
@@ -176,6 +183,57 @@ def test_library_pagination_respects_the_api_page_limit() -> None:
 
     assert len(documents) == 101
     assert requested_offsets == [0, 100]
+
+
+def test_document_page_query_encodes_repeated_statuses_and_fixed_sort() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/documents"
+        assert request.url.params.multi_items() == [
+            ("limit", "25"),
+            ("offset", "50"),
+            ("q", "Résumé 100%_ [plan]"),
+            ("status", "failed"),
+            ("status", "deletion_failed"),
+            ("sort", "name"),
+            ("order", "asc"),
+        ]
+        return httpx.Response(
+            200,
+            json={"items": [_document_payload()], "total": 51, "limit": 25, "offset": 50},
+        )
+
+    with _client(handler) as client:
+        page = client.list_documents(
+            limit=25,
+            offset=50,
+            query="Résumé 100%_ [plan]",
+            statuses=[
+                DocumentStatus.FAILED,
+                DocumentStatus.DELETION_FAILED,
+                DocumentStatus.FAILED,
+            ],
+            sort=DocumentSort.NAME,
+            order=SortOrder.ASC,
+        )
+
+    assert page.total == 51
+    assert page.items[0].id == "doc-1"
+
+
+def test_default_document_page_request_keeps_the_legacy_query_shape() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/documents"
+        assert request.url.params.multi_items() == [("limit", "100"), ("offset", "0")]
+        return httpx.Response(
+            200,
+            json={"items": [], "total": 0, "limit": 100, "offset": 0},
+        )
+
+    with _client(handler) as client:
+        page = client.list_documents()
+
+    assert page.items == []
+    assert page.total == 0
 
 
 def test_client_maps_error_envelope_without_exposing_raw_response() -> None:

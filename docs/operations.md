@@ -25,7 +25,8 @@ OpenAI still supplies the answer model.
 
 RAG_UPLOAD_MAX_BYTES may be lowered but cannot exceed the Streamlit and API hard ceiling of
 25 MiB. RAG_MAX_QUERY_CHARACTERS may be lowered but cannot exceed the request-schema ceiling of
-4,000 characters. Startup rejects values above either shared ceiling.
+4,000 RAG-question characters. Document-metadata search has a separate fixed 200-character
+ceiling. Startup rejects values above either shared configurable ceiling.
 
 Changing provider, embedding model, dimensions, chunk size, overlap, or parser version changes
 the embedding fingerprint. Existing vectors must be rebuilt into a compatible collection; the
@@ -76,6 +77,24 @@ make ui
 
 Open `http://127.0.0.1:8501`. FastAPI documentation is available at
 `http://127.0.0.1:8000/docs` in development only.
+
+### Library search and navigation
+
+- **Apply filters** submits the current filename/type query, status group, and sort together; form
+  edits do not issue a new search on every keystroke.
+- Status groups are **All**, **Ready**, **Needs attention**, and **Processing**. The latter two map
+  to multiple backend states with OR semantics.
+- Sort choices are recently added, recently updated, name A-Z, and name Z-A. Ten results appear per
+  page with an exact filtered total and deterministic tie-breaking.
+- Select one document to expose its status, technical details, refresh action, and typed permanent
+  removal confirmation. On a phone, the detail follows the selection list; the interface labels
+  that relationship explicitly.
+- A non-empty library prioritizes filters and the working document list; **Add documents** remains
+  available afterward in a collapsed disclosure. An empty library opens upload immediately.
+- Search covers display-name and extension metadata, not document bodies, snippets, or vectors.
+
+This is a schema-v2-compatible application upgrade. It requires no migration, Qdrant mutation,
+reindex, or provider spend.
 
 ### Conversations and activity
 
@@ -200,8 +219,15 @@ tree is never treated as an authorized path.
 - **Qdrant unavailable:** confirm the Qdrant version/host/port, API key, and private service health.
 - **Embedding profile mismatch:** restore the previous configuration or perform a deliberate full
   reindex. Do not point a new dimension at an existing collection.
-- **Document failed:** inspect its safe error code in Library; encrypted, image-only, corrupt,
+- **Document failed:** inspect its safe error code in Documents; encrypted, image-only, corrupt,
   unsupported, empty, and oversized files require different corrective action.
+- **No documents match:** clear the query or choose **All**, then apply filters again. Search is
+  literal metadata matching; it does not search words inside a file.
+- **Library page changed while loading:** the UI moves back one page automatically when a
+  concurrent removal empties a boundary page. If the first page is momentarily inconsistent, use
+  **Refresh library**; no document state is changed by this recovery.
+- **Library service error:** restore the API connection, then choose **Apply filters** again. The UI
+  does not discard stored documents when a page read fails.
 - **Question appears pending:** wait for the active reservation lease before retrying. The same
   client turn ID prevents a duplicate paid call; a retryable failed turn can safely be retried.
 - **Activity is empty after an action:** refresh the page once and verify the API/worker are using

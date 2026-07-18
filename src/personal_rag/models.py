@@ -28,6 +28,17 @@ class DocumentStatus(StrEnum):
     DELETED = "deleted"
 
 
+class DocumentSort(StrEnum):
+    CREATED = "created"
+    UPDATED = "updated"
+    NAME = "name"
+
+
+class SortOrder(StrEnum):
+    ASC = "asc"
+    DESC = "desc"
+
+
 class JobKind(StrEnum):
     INGEST = "ingest"
     REINDEX = "reindex"

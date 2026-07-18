@@ -7,10 +7,12 @@ from typing import TYPE_CHECKING
 from personal_rag.models import (
     ConversationTurnStatus,
     DependencyState,
+    DocumentSort,
     DocumentStatus,
     JobKind,
     JobStage,
     JobStatus,
+    SortOrder,
     SystemStatus,
 )
 from personal_rag.ui.client import ApiClientError
@@ -38,6 +40,10 @@ def _text_input(app: AppTest, label: str):  # type: ignore[no-untyped-def]
 
 def _text_area(app: AppTest, label: str):  # type: ignore[no-untyped-def]
     return next(widget for widget in app.text_area if widget.label == label)
+
+
+def _selectbox(app: AppTest, label: str):  # type: ignore[no-untyped-def]
+    return next(widget for widget in app.selectbox if widget.label == label)
 
 
 def _navigate(app: AppTest, section: str) -> AppTest:
@@ -89,11 +95,46 @@ def test_ready_workspace_defaults_to_ask_and_hides_operator_controls(
 
     assert not result.exception
     assert "Ask your library" in _visible_text(result)
-    assert "A fresh conversation" in _visible_text(result)
+    assert "New conversation" in _visible_text(result)
     assert "Sources to retrieve" not in _visible_text(result)
-    assert any(expander.label == "Search options" for expander in result.expander)
+    assert any(expander.label == "Where to look" for expander in result.expander)
+    assert any(expander.label == "Saved conversations" for expander in result.expander)
+    button_labels = [button.label for button in result.button]
+    assert button_labels.index("Ask library") < button_labels.index("Summarize the main points")
     assert fake_client.health_live_calls == 0
     assert fake_client.health_ready_calls == 0
+
+
+def test_suggestion_seeds_a_new_question_widget_after_the_primary_form(
+    app_test: AppTest, fake_client: FakeRagClient
+) -> None:
+    result = _ready_app(app_test, fake_client)
+
+    _button(result, "Summarize the main points").click()
+    result = result.run()
+
+    assert not result.exception
+    assert result.session_state["question_draft_version"] == 1
+    assert _text_area(result, "Your question").value == "Summarize the main points"
+    button_labels = [button.label for button in result.button]
+    assert button_labels.index("Ask library") < button_labels.index("Summarize the main points")
+
+
+def test_saved_conversation_management_is_secondary_but_reachable(
+    app_test: AppTest, fake_client: FakeRagClient
+) -> None:
+    fake_client.documents = [make_document()]
+    fake_client.system_status = ready_status(document_count=1)
+    fake_client.conversations = [make_conversation()]
+    fake_client.turns = {"conversation-1": [make_turn()]}
+
+    result = app_test.run()
+
+    assert any(expander.label == "Saved conversations" for expander in result.expander)
+    assert "Current conversation" in _visible_text(result)
+    previous = _selectbox(result, "Previous conversations")
+    assert previous.value == "conversation-1"
+    assert previous.options == ["Atlas launch notes"]
 
 
 def test_conditional_navigation_avoids_hidden_system_health_calls(
@@ -333,8 +374,13 @@ def test_document_search_refresh_and_confirmed_removal(
 
     _text_input(result, "Find a document").set_value("beta")
     result = result.run()
-    assert any("beta-plan.md" in expander.label for expander in result.expander)
-    assert not any("alpha-notes.md" in expander.label for expander in result.expander)
+    _button(result, "Apply filters").click()
+    result = result.run()
+    document_choices = next(
+        radio for radio in result.radio if radio.label == "Documents on this page"
+    )
+    assert any("beta-plan.md" in option for option in document_choices.options)
+    assert not any("alpha-notes.md" in option for option in document_choices.options)
 
     _button(result, "Refresh document").click()
     result = result.run()
@@ -348,6 +394,115 @@ def test_document_search_refresh_and_confirmed_removal(
     result = result.run()
     assert fake_client.delete_calls == ["doc-beta"]
     assert "Removing beta-plan.md" in _visible_text(result)
+
+
+def test_nonempty_documents_is_library_first_and_requests_one_page(
+    app_test: AppTest, fake_client: FakeRagClient
+) -> None:
+    fake_client.documents = [
+        make_document("alpha.md", document_id="doc-alpha"),
+        make_document("beta.md", document_id="doc-beta"),
+    ]
+    fake_client.system_status = ready_status(document_count=2)
+    result = app_test.run()
+    ask_reads = fake_client.list_all_documents_calls
+
+    result = _navigate(result, "Documents")
+
+    assert not result.exception
+    assert str(result.subheader[0].value) == "Your library"
+    assert any(expander.label == "Add documents" for expander in result.expander)
+    assert fake_client.list_all_documents_calls == ask_reads
+    assert len(fake_client.document_page_requests) == 1
+    assert fake_client.document_page_requests[0]["limit"] == 10
+    assert len([item for item in result.text_input if item.label.startswith('Type "')]) == 1
+
+
+def test_document_filters_are_applied_once_with_server_contract(
+    app_test: AppTest, fake_client: FakeRagClient
+) -> None:
+    fake_client.documents = [
+        make_document("alpha-notes.md", document_id="doc-alpha", status=DocumentStatus.FAILED),
+        make_document(
+            "beta-notes.pdf",
+            document_id="doc-beta",
+            status=DocumentStatus.DELETION_FAILED,
+        ),
+        make_document("ready-notes.md", document_id="doc-ready"),
+    ]
+    fake_client.system_status = ready_status(document_count=3)
+    result = _navigate(app_test.run(), "Documents")
+    initial_requests = len(fake_client.document_page_requests)
+
+    _text_input(result, "Find a document").set_value("notes")
+    _selectbox(result, "Status").set_value("Needs attention")
+    _selectbox(result, "Sort by").set_value("Name A-Z")
+    _button(result, "Apply filters").click()
+    result = result.run()
+
+    assert len(fake_client.document_page_requests) == initial_requests + 1
+    request = fake_client.document_page_requests[-1]
+    assert request["query"] == "notes"
+    assert request["statuses"] == (
+        DocumentStatus.FAILED,
+        DocumentStatus.DELETION_FAILED,
+    )
+    assert request["sort"] is DocumentSort.NAME
+    assert request["order"] is SortOrder.ASC
+    assert request["offset"] == 0
+    choices = next(radio for radio in result.radio if radio.label == "Documents on this page")
+    assert choices.options == [
+        "alpha-notes.md — Needs attention",
+        "beta-notes.pdf — Needs attention",
+    ]
+
+
+def test_document_pagination_resets_when_filters_are_applied(
+    app_test: AppTest, fake_client: FakeRagClient
+) -> None:
+    fake_client.documents = [
+        make_document(f"file-{index:03d}.md", document_id=f"doc-{index:03d}") for index in range(21)
+    ]
+    fake_client.system_status = ready_status(document_count=21)
+    result = _navigate(app_test.run(), "Documents")
+
+    _button(result, "Next page").click()
+    result = result.run()
+    assert fake_client.document_page_requests[-1]["offset"] == 10
+    choices = next(radio for radio in result.radio if radio.label == "Documents on this page")
+    assert result.session_state["selected_document_id"] in {
+        document.id
+        for document in fake_client.documents
+        if any(document.display_name in option for option in choices.options)
+    }
+
+    _text_input(result, "Find a document").set_value("file-000")
+    result = result.run()
+    _button(result, "Apply filters").click()
+    result = result.run()
+
+    assert fake_client.document_page_requests[-1]["offset"] == 0
+    assert result.session_state["selected_document_id"] == "doc-000"
+
+
+def test_inconsistent_empty_boundary_page_recovers_without_crashing(
+    app_test: AppTest, fake_client: FakeRagClient
+) -> None:
+    fake_client.documents = [
+        make_document(f"file-{index:03d}.md", document_id=f"doc-{index:03d}") for index in range(11)
+    ]
+    fake_client.system_status = ready_status(document_count=11)
+    result = _navigate(app_test.run(), "Documents")
+
+    _button(result, "Next page").click()
+    result = result.run()
+    assert fake_client.document_page_requests[-1]["offset"] == 10
+    fake_client.inconsistent_document_page_once = True
+    result = result.run()
+
+    assert not result.exception
+    assert [request["offset"] for request in fake_client.document_page_requests[-2:]] == [10, 0]
+    assert result.session_state["selected_document_id"] == "doc-010"
 
 
 def test_deletion_failure_offers_clear_retry_path(
@@ -479,13 +634,19 @@ def test_api_outage_explains_that_saved_work_is_untouched(
 def test_hostile_document_text_is_never_inserted_into_unsafe_html(
     app_test: AppTest, fake_client: FakeRagClient
 ) -> None:
-    hostile_name = "<script>window.bad=true</script>.md"
+    hostile_name = "<script>$x$ ~~window.bad=true~~</script>.md"
     fake_client.documents = [make_document(hostile_name)]
     fake_client.system_status = ready_status(document_count=1)
 
     result = _navigate(app_test.run(), "Documents")
 
-    assert hostile_name in "\n".join(expander.label for expander in result.expander)
+    document_choices = next(
+        radio for radio in result.radio if radio.label == "Documents on this page"
+    )
+    assert any(hostile_name in option for option in document_choices.options)
+    detail_heading = next(heading for heading in result.subheader if "script" in str(heading.value))
+    assert r"\$x\$" in str(detail_heading.value)
+    assert r"\~\~window.bad=true\~\~" in str(detail_heading.value)
     assert "server-secret" not in _visible_text(result)
     assert "OPENAI_API_KEY" not in _visible_text(result)
     assert not result.exception
@@ -508,7 +669,7 @@ def test_saved_conversation_can_be_hard_deleted_without_touching_documents(
 
     assert fake_client.conversations == []
     assert len(fake_client.documents) == 1
-    assert "A fresh conversation" in _visible_text(result)
+    assert "New conversation" in _visible_text(result)
 
 
 def test_conversation_picker_loads_beyond_the_first_api_page(

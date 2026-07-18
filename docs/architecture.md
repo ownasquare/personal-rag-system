@@ -49,6 +49,21 @@ flowchart LR
 6. Only a fully verified index is marked `ready`. Failed work remains visible with a stable,
    sanitized error code and may be retried.
 
+### Library metadata search
+
+1. Streamlit keeps draft filters inside a form. Submitting them updates the applied query, status
+   group, fixed sort, page offset, and selected-document hint before requesting one ten-item page.
+2. FastAPI validates and normalizes the optional metadata query and repeated status enums. SQLite
+   alone evaluates literal display-name/extension matching through a deterministic Unicode
+   normalization/casefold function.
+3. Search values stay parameterized, while `DocumentSort` and `SortOrder` map only to hardcoded SQL
+   fragments. List and count reuse one predicate builder; deleted exclusion is backend-owned.
+4. Every ordering uses document ID as a tie-breaker, preserving page boundaries on an unchanged
+   dataset. List and count are separate short reads, so the UI safely clamps or refreshes a page
+   made empty by a concurrent add or removal.
+5. This flow leaves SQLite schema version 2 unchanged and never reads file bodies, snippets,
+   embeddings, or Qdrant. It requires no reindex and incurs no provider call.
+
 ### Retrieval and answer generation
 
 1. FastAPI validates query length, history depth, `top_k`, and optional document filters.
@@ -59,8 +74,9 @@ flowchart LR
    deleted, or stale document version therefore fails closed even if an old vector remains.
 5. Source text is placed inside explicit untrusted-data delimiters. The answer model receives no
    tools and is instructed never to follow source-embedded instructions.
-6. Citations are built from retrieved node metadata, not generated citation prose. Unsupported
-   citation markers are removed.
+6. Citations are built from retrieved node metadata, not generated citation prose. An unsupported
+   or malformed citation marker fails closed to deterministic abstention; it is not silently
+   removed from otherwise accepted model text.
 7. Empty or low-confidence retrieval returns a deterministic abstention instead of forcing an
    answer.
 
@@ -102,17 +118,18 @@ privacy-complete deletion while cited answer content remains in the active datab
 - Qdrant is authoritative only for vector records. It does not decide whether an ingestion or
   deletion operation is complete.
 - The upload volume is private application state. No raw-file route is exposed.
-- Streamlit session state owns only navigation, unsubmitted draft text, and immediate presentation
-  hints. A browser refresh re-reads documents, jobs, conversations, turns, and citations from
+- Streamlit session state owns only navigation, unsubmitted draft text, document query/filter/sort
+  drafts, the applied page offset and selected-row hint, and other immediate presentation state. A
+  browser refresh re-reads authoritative documents, jobs, conversations, turns, and citations from
   FastAPI. The Activity page refreshes on demand instead of maintaining an idle polling loop after
   work is terminal.
 
 ## Embedding compatibility
 
 An immutable fingerprint covers provider, model, dimensions, cosine distance, parser version,
-chunker, chunk size, and overlap. Qdrant fixes vector dimensions after collection creation, so a changed
-embedding profile must never be mixed into the same collection. The service blocks incompatible
-operation and requires an explicit full reindex into a compatible collection.
+chunker, chunk size, and overlap. Qdrant fixes vector dimensions after collection creation, so a
+changed embedding profile must never be mixed into the same collection. The service blocks
+incompatible operation and requires an explicit full reindex into a compatible collection.
 
 Supported profiles are:
 

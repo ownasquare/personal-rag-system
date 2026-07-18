@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import TypeVar
 from urllib.parse import quote
 
@@ -22,10 +22,13 @@ from personal_rag.models import (
     ConversationTurnList,
     DocumentList,
     DocumentPublic,
+    DocumentSort,
+    DocumentStatus,
     ErrorEnvelope,
     JobList,
     JobRecord,
     JobStatus,
+    SortOrder,
     SystemStatus,
     UploadReceipt,
 )
@@ -39,6 +42,10 @@ DEFAULT_HTTP_TIMEOUT = httpx.Timeout(
 TERMINAL_JOB_STATUSES = {JobStatus.SUCCEEDED, JobStatus.FAILED}
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+QueryScalar = str | int | float | bool | None
+QueryParamsInput = (
+    Mapping[str, QueryScalar | Sequence[QueryScalar]] | list[tuple[str, QueryScalar]] | None
+)
 
 
 class HealthCheck(BaseModel):
@@ -124,12 +131,31 @@ class RagApiClient:
         data = self._request_json("GET", "/api/v1/status")
         return self._parse_model(data, SystemStatus)
 
-    def list_documents(self, *, limit: int = 100, offset: int = 0) -> DocumentList:
-        data = self._request_json(
-            "GET",
-            "/api/v1/documents",
-            params=self._pagination_params(limit=limit, offset=offset),
+    def list_documents(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        query: str | None = None,
+        statuses: Sequence[DocumentStatus] | None = None,
+        sort: DocumentSort = DocumentSort.CREATED,
+        order: SortOrder = SortOrder.DESC,
+    ) -> DocumentList:
+        params: list[tuple[str, QueryScalar]] = list(
+            self._pagination_params(limit=limit, offset=offset).items()
         )
+        if query is not None:
+            params.append(("q", query))
+        if statuses:
+            unique_statuses = dict.fromkeys(DocumentStatus(status) for status in statuses)
+            params.extend(("status", status.value) for status in unique_statuses)
+        normalized_sort = DocumentSort(sort)
+        normalized_order = SortOrder(order)
+        if normalized_sort is not DocumentSort.CREATED:
+            params.append(("sort", normalized_sort.value))
+        if normalized_order is not SortOrder.DESC:
+            params.append(("order", normalized_order.value))
+        data = self._request_json("GET", "/api/v1/documents", params=params)
         return self._parse_model(data, DocumentList)
 
     def list_all_documents(self, *, max_documents: int = 2000) -> list[DocumentPublic]:
@@ -316,7 +342,7 @@ class RagApiClient:
         method: str,
         path: str,
         *,
-        params: Mapping[str, str | int] | None = None,
+        params: QueryParamsInput = None,
         json_body: object | None = None,
         files: Mapping[str, tuple[str, bytes, str]] | None = None,
     ) -> object:

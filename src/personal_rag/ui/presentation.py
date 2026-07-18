@@ -148,6 +148,23 @@ STATIC_STYLES = """
     border-color: var(--line);
   }
 
+  div[data-testid="stRadio"] [role="radiogroup"] {
+    gap: 0.38rem;
+  }
+
+  div[data-testid="stRadio"] [role="radiogroup"] label {
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin: 0;
+    padding: 0.58rem 0.7rem;
+  }
+
+  div[data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+  }
+
   .stButton > button,
   .stFormSubmitButton > button {
     border-radius: 7px;
@@ -193,6 +210,12 @@ STATIC_STYLES = """
     div[data-testid="stSegmentedControl"] label {
       font-size: 0.82rem;
       padding-inline: 0.55rem !important;
+    }
+
+    .stButton > button,
+    .stFormSubmitButton > button,
+    div[data-testid="stRadio"] [role="radiogroup"] label {
+      min-height: 2.75rem;
     }
   }
 </style>

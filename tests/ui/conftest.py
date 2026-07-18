@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,12 +23,14 @@ from personal_rag.models import (
     DependencyState,
     DocumentList,
     DocumentPublic,
+    DocumentSort,
     DocumentStatus,
     JobKind,
     JobList,
     JobRecord,
     JobStage,
     JobStatus,
+    SortOrder,
     SystemStatus,
     UploadReceipt,
 )
@@ -183,6 +186,9 @@ class FakeRagClient:
     no_answer: bool = False
     get_status_calls: int = 0
     list_documents_calls: int = 0
+    list_all_documents_calls: int = 0
+    document_page_requests: list[dict[str, object]] = field(default_factory=list)
+    inconsistent_document_page_once: bool = False
     list_jobs_calls: int = 0
     list_conversations_calls: int = 0
     health_live_calls: int = 0
@@ -202,12 +208,71 @@ class FakeRagClient:
             raise self.status_error
         return self.system_status
 
-    def list_documents(self, *, limit: int = 100, offset: int = 0) -> DocumentList:
-        items = self.documents[offset : offset + limit]
-        return DocumentList(items=items, total=len(self.documents), limit=limit, offset=offset)
+    def list_documents(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        query: str | None = None,
+        statuses: Sequence[DocumentStatus] | None = None,
+        sort: DocumentSort = DocumentSort.CREATED,
+        order: SortOrder = SortOrder.DESC,
+    ) -> DocumentList:
+        self.list_documents_calls += 1
+        normalized_statuses = (
+            tuple(dict.fromkeys(DocumentStatus(status) for status in statuses))
+            if statuses
+            else None
+        )
+        normalized_sort = DocumentSort(sort)
+        normalized_order = SortOrder(order)
+        self.document_page_requests.append(
+            {
+                "limit": limit,
+                "offset": offset,
+                "query": query,
+                "statuses": normalized_statuses,
+                "sort": normalized_sort,
+                "order": normalized_order,
+            }
+        )
+
+        items = [
+            document for document in self.documents if document.status is not DocumentStatus.DELETED
+        ]
+        if query is not None:
+            needle = query.casefold()
+            items = [
+                document
+                for document in items
+                if needle in document.display_name.casefold()
+                or needle in document.extension.casefold()
+            ]
+        if normalized_statuses is not None:
+            allowed = set(normalized_statuses)
+            items = [document for document in items if document.status in allowed]
+
+        def sort_key(document: DocumentPublic) -> tuple[object, str]:
+            if normalized_sort is DocumentSort.NAME:
+                return document.display_name.casefold(), document.id
+            if normalized_sort is DocumentSort.UPDATED:
+                return document.updated_at, document.id
+            return document.created_at, document.id
+
+        items.sort(key=sort_key, reverse=normalized_order is SortOrder.DESC)
+        total = len(items)
+        if self.inconsistent_document_page_once and total > 0:
+            self.inconsistent_document_page_once = False
+            return DocumentList(items=[], total=total, limit=limit, offset=offset)
+        return DocumentList(
+            items=items[offset : offset + limit],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
 
     def list_all_documents(self, *, max_documents: int = 2000) -> list[DocumentPublic]:
-        self.list_documents_calls += 1
+        self.list_all_documents_calls += 1
         if self.documents_error is not None:
             raise self.documents_error
         return self.documents[:max_documents]

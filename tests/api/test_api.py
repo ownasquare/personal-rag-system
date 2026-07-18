@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,11 +29,13 @@ from personal_rag.models import (
     ConversationTurnStatus,
     DocumentPublic,
     DocumentRecord,
+    DocumentSort,
     DocumentStatus,
     JobKind,
     JobRecord,
     JobStage,
     JobStatus,
+    SortOrder,
     UploadReceipt,
 )
 
@@ -93,15 +97,59 @@ class FakeRepository:
         )
 
     def list_documents(
-        self, *, limit: int, offset: int, status: DocumentStatus | None = None
+        self,
+        *,
+        limit: int,
+        offset: int,
+        query: str | None = None,
+        statuses: Sequence[DocumentStatus] | None = None,
+        sort: DocumentSort = DocumentSort.CREATED,
+        order: SortOrder = SortOrder.DESC,
     ) -> list[DocumentRecord]:
-        items = list(self.documents.values())
-        if status is not None:
-            items = [item for item in items if item.status is status]
+        items = [
+            item for item in self.documents.values() if item.status is not DocumentStatus.DELETED
+        ]
+        if statuses:
+            selected_statuses = {DocumentStatus(value) for value in statuses}
+            items = [item for item in items if item.status in selected_statuses]
+        if query:
+            normalized_query = unicodedata.normalize("NFC", query).casefold()
+            items = [
+                item
+                for item in items
+                if normalized_query
+                in unicodedata.normalize("NFC", f"{item.display_name} {item.extension}").casefold()
+            ]
+        sort_value = DocumentSort(sort)
+        reverse = SortOrder(order) is SortOrder.DESC
+        if sort_value is DocumentSort.CREATED:
+            items.sort(key=lambda item: (item.created_at, item.id), reverse=reverse)
+        elif sort_value is DocumentSort.UPDATED:
+            items.sort(key=lambda item: (item.updated_at, item.id), reverse=reverse)
+        else:
+            items.sort(
+                key=lambda item: (
+                    unicodedata.normalize("NFC", item.display_name).casefold(),
+                    item.id,
+                ),
+                reverse=reverse,
+            )
         return items[offset : offset + limit]
 
-    def count_documents(self, *, status: DocumentStatus | None = None) -> int:
-        return len(self.list_documents(limit=1000, offset=0, status=status))
+    def count_documents(
+        self,
+        *,
+        query: str | None = None,
+        statuses: Sequence[DocumentStatus] | None = None,
+    ) -> int:
+        return len(
+            self.list_documents(
+                limit=10_000,
+                offset=0,
+                query=query,
+                statuses=statuses,
+            )
+        )
 
     def get_document(self, document_id: str) -> DocumentRecord | None:
         return self.documents.get(document_id)
@@ -524,6 +572,34 @@ def auth_headers() -> dict[str, str]:
     return {"Authorization": "Bearer test-api-key-which-is-long"}
 
 
+def _store_document(
+    repository: FakeRepository,
+    *,
+    document_id: str,
+    display_name: str,
+    status: DocumentStatus = DocumentStatus.READY,
+    created_at: datetime,
+    updated_at: datetime,
+) -> None:
+    extension = Path(display_name).suffix.lower() or ".txt"
+    repository.documents[document_id] = DocumentRecord(
+        id=document_id,
+        display_name=display_name,
+        stored_path=f"{document_id}{extension}",
+        content_type="text/markdown" if extension == ".md" else "text/plain",
+        extension=extension,
+        content_sha256=hashlib.sha256(document_id.encode()).hexdigest(),
+        size_bytes=128,
+        status=status,
+        embedding_fingerprint="a" * 64,
+        active_version=1 if status is DocumentStatus.READY else 0,
+        chunk_count=1 if status is DocumentStatus.READY else 0,
+        created_at=created_at,
+        updated_at=updated_at,
+        deleted_at=updated_at if status is DocumentStatus.DELETED else None,
+    )
+
+
 def test_liveness_is_public_and_has_request_id(client: TestClient) -> None:
     response = client.get("/health/live")
     assert response.status_code == 200
@@ -654,6 +730,229 @@ def test_document_list_and_job_readback(client: TestClient, auth_headers: dict[s
     assert listed.json()["total"] == 1
     assert job.status_code == 200
     assert job.json()["document_id"] == uploaded["document"]["id"]
+
+
+def test_document_list_keeps_default_order_and_single_status_compatibility(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    repository: FakeRepository,
+) -> None:
+    start = datetime(2026, 7, 18, 8, 0, tzinfo=UTC)
+    _store_document(
+        repository,
+        document_id="doc-old-ready",
+        display_name="old-ready.md",
+        created_at=start,
+        updated_at=start + timedelta(hours=2),
+    )
+    _store_document(
+        repository,
+        document_id="doc-new-failed",
+        display_name="new-failed.md",
+        status=DocumentStatus.FAILED,
+        created_at=start + timedelta(days=1),
+        updated_at=start + timedelta(days=1),
+    )
+    _store_document(
+        repository,
+        document_id="doc-newest-ready",
+        display_name="newest-ready.md",
+        created_at=start + timedelta(days=2),
+        updated_at=start + timedelta(days=2),
+    )
+
+    default = client.get("/api/v1/documents", headers=auth_headers)
+    ready = client.get(
+        "/api/v1/documents",
+        params={"status": "ready"},
+        headers=auth_headers,
+    )
+
+    assert default.status_code == 200
+    assert [item["id"] for item in default.json()["items"]] == [
+        "doc-newest-ready",
+        "doc-new-failed",
+        "doc-old-ready",
+    ]
+    assert default.json()["total"] == 3
+    assert {item["id"] for item in ready.json()["items"]} == {
+        "doc-old-ready",
+        "doc-newest-ready",
+    }
+    assert ready.json()["total"] == 2
+
+
+def test_document_list_applies_literal_query_repeated_statuses_and_filtered_total(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    repository: FakeRepository,
+) -> None:
+    now = datetime(2026, 7, 18, 8, 0, tzinfo=UTC)
+    _store_document(
+        repository,
+        document_id="doc-failed",
+        display_name="Plan%_ Résumé.md",
+        status=DocumentStatus.FAILED,
+        created_at=now,
+        updated_at=now,
+    )
+    _store_document(
+        repository,
+        document_id="doc-deletion-failed",
+        display_name="Plan%_ deletion.txt",
+        status=DocumentStatus.DELETION_FAILED,
+        created_at=now + timedelta(minutes=1),
+        updated_at=now + timedelta(minutes=1),
+    )
+    _store_document(
+        repository,
+        document_id="doc-ready",
+        display_name="Plan%_ ready.md",
+        created_at=now + timedelta(minutes=2),
+        updated_at=now + timedelta(minutes=2),
+    )
+    _store_document(
+        repository,
+        document_id="doc-deleted",
+        display_name="Plan%_ deleted.md",
+        status=DocumentStatus.DELETED,
+        created_at=now + timedelta(minutes=3),
+        updated_at=now + timedelta(minutes=3),
+    )
+
+    response = client.get(
+        "/api/v1/documents",
+        params=[
+            ("status", "failed"),
+            ("status", "deletion_failed"),
+            ("q", " PLAN%_ "),
+            ("sort", "name"),
+            ("order", "asc"),
+            ("limit", "1"),
+            ("offset", "0"),
+        ],
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 2
+    assert payload["limit"] == 1
+    assert payload["offset"] == 0
+    assert [item["id"] for item in payload["items"]] == ["doc-deletion-failed"]
+
+
+@pytest.mark.parametrize(
+    ("sort", "order", "expected_ids"),
+    [
+        ("created", "asc", ["doc-zulu", "doc-alpha", "doc-middle"]),
+        ("created", "desc", ["doc-middle", "doc-alpha", "doc-zulu"]),
+        ("updated", "asc", ["doc-alpha", "doc-middle", "doc-zulu"]),
+        ("updated", "desc", ["doc-zulu", "doc-middle", "doc-alpha"]),
+        ("name", "asc", ["doc-alpha", "doc-middle", "doc-zulu"]),
+        ("name", "desc", ["doc-zulu", "doc-middle", "doc-alpha"]),
+    ],
+)
+def test_document_list_supports_each_fixed_sort_and_order(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    repository: FakeRepository,
+    sort: str,
+    order: str,
+    expected_ids: list[str],
+) -> None:
+    start = datetime(2026, 7, 18, 8, 0, tzinfo=UTC)
+    _store_document(
+        repository,
+        document_id="doc-zulu",
+        display_name="Zulu.md",
+        created_at=start,
+        updated_at=start + timedelta(days=3),
+    )
+    _store_document(
+        repository,
+        document_id="doc-alpha",
+        display_name="Alpha.md",
+        created_at=start + timedelta(days=1),
+        updated_at=start + timedelta(days=1),
+    )
+    _store_document(
+        repository,
+        document_id="doc-middle",
+        display_name="Middle.md",
+        created_at=start + timedelta(days=2),
+        updated_at=start + timedelta(days=2),
+    )
+
+    response = client.get(
+        "/api/v1/documents",
+        params={"sort": sort, "order": order},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == expected_ids
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "notes\x00private",
+        "notes\u200bprivate",
+        "\nprivate",
+        "\ue000private",
+    ],
+)
+def test_document_list_rejects_control_or_format_queries_without_echoing_them(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    query: str,
+) -> None:
+    response = client.get(
+        "/api/v1/documents",
+        params={"q": query},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_document_query"
+    assert "private" not in response.text
+
+
+def test_document_list_rejects_overlong_query_with_sanitized_validation(
+    client: TestClient,
+    auth_headers: dict[str, str],
+) -> None:
+    response = client.get(
+        "/api/v1/documents",
+        params={"q": "x" * 201},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert "x" * 32 not in response.text
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value"),
+    [("status", "unknown"), ("sort", "score"), ("order", "sideways")],
+)
+def test_document_list_rejects_invalid_enums_with_sanitized_validation(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    parameter: str,
+    value: str,
+) -> None:
+    response = client.get(
+        "/api/v1/documents",
+        params={parameter: value},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert value not in response.text
 
 
 def test_recent_jobs_are_paginated_and_filterable(

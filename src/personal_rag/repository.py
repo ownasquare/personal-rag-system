@@ -6,13 +6,14 @@ import hashlib
 import json
 import re
 import sqlite3
+import unicodedata
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any, cast
 from uuid import uuid4
 
-from personal_rag.database import Database
+from personal_rag.database import Database, unicode_casefold
 from personal_rag.errors import RagError
 from personal_rag.models import (
     ChatHistoryMessage,
@@ -23,17 +24,34 @@ from personal_rag.models import (
     ConversationTurnStatus,
     DocumentPublic,
     DocumentRecord,
+    DocumentSort,
     DocumentStatus,
     JobKind,
     JobRecord,
     JobStage,
     JobStatus,
+    SortOrder,
     UploadReceipt,
     utc_now,
 )
 
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _MAX_PAGE_SIZE = 200
+
+_DOCUMENT_SORT_SQL: dict[tuple[DocumentSort, SortOrder], str] = {
+    (DocumentSort.CREATED, SortOrder.ASC): "documents.created_at ASC, documents.id ASC",
+    (DocumentSort.CREATED, SortOrder.DESC): "documents.created_at DESC, documents.id DESC",
+    (DocumentSort.UPDATED, SortOrder.ASC): "documents.updated_at ASC, documents.id ASC",
+    (DocumentSort.UPDATED, SortOrder.DESC): "documents.updated_at DESC, documents.id DESC",
+    (
+        DocumentSort.NAME,
+        SortOrder.ASC,
+    ): "unicode_casefold(documents.display_name) ASC, documents.id ASC",
+    (
+        DocumentSort.NAME,
+        SortOrder.DESC,
+    ): "unicode_casefold(documents.display_name) DESC, documents.id DESC",
+}
 
 _DOCUMENT_TRANSITIONS: dict[DocumentStatus, frozenset[DocumentStatus]] = {
     DocumentStatus.QUEUED: frozenset(
@@ -879,57 +897,97 @@ class Repository:
         limit: int = 50,
         offset: int = 0,
         status: DocumentStatus | None = None,
+        statuses: Sequence[DocumentStatus] | None = None,
+        query: str | None = None,
+        sort: DocumentSort = DocumentSort.CREATED,
+        order: SortOrder = SortOrder.DESC,
         include_deleted: bool = False,
     ) -> list[DocumentRecord]:
         self._validate_pagination(limit, offset)
-        parameters: list[Any]
-        if status is None:
-            query = (
-                "SELECT * FROM documents ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-                if include_deleted
-                else "SELECT * FROM documents WHERE status <> 'deleted' "
-                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        normalized_sort = DocumentSort(sort)
+        normalized_order = SortOrder(order)
+        where_sql, parameters = self._document_filter_sql(
+            status=status,
+            statuses=statuses,
+            query=query,
+            include_deleted=include_deleted,
+        )
+        statement = " ".join(
+            (
+                "SELECT documents.* FROM documents",
+                where_sql,
+                "ORDER BY",
+                _DOCUMENT_SORT_SQL[(normalized_sort, normalized_order)],
+                "LIMIT ? OFFSET ?",
             )
-            parameters = [limit, offset]
-        else:
-            normalized_status = DocumentStatus(status).value
-            query = (
-                "SELECT * FROM documents WHERE status = ? "
-                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-                if include_deleted
-                else "SELECT * FROM documents WHERE status = ? AND status <> 'deleted' "
-                "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-            )
-            parameters = [normalized_status, limit, offset]
+        )
+        parameters.extend((limit, offset))
         with self.database.connection() as connection:
-            rows = connection.execute(query, parameters).fetchall()
+            rows = connection.execute(statement, parameters).fetchall()
         return [self._document_from_row(row) for row in rows]
 
     def count_documents(
         self,
         *,
         status: DocumentStatus | None = None,
+        statuses: Sequence[DocumentStatus] | None = None,
+        query: str | None = None,
         include_deleted: bool = False,
     ) -> int:
-        parameters: list[Any]
-        if status is None:
-            query = (
-                "SELECT COUNT(*) AS total FROM documents"
-                if include_deleted
-                else "SELECT COUNT(*) AS total FROM documents WHERE status <> 'deleted'"
-            )
-            parameters = []
-        else:
-            query = (
-                "SELECT COUNT(*) AS total FROM documents WHERE status = ?"
-                if include_deleted
-                else "SELECT COUNT(*) AS total FROM documents "
-                "WHERE status = ? AND status <> 'deleted'"
-            )
-            parameters = [DocumentStatus(status).value]
+        where_sql, parameters = self._document_filter_sql(
+            status=status,
+            statuses=statuses,
+            query=query,
+            include_deleted=include_deleted,
+        )
+        statement = " ".join(("SELECT COUNT(*) AS total FROM documents", where_sql))
         with self.database.connection() as connection:
-            row = connection.execute(query, parameters).fetchone()
+            row = connection.execute(statement, parameters).fetchone()
         return int(row["total"])
+
+    def _document_filter_sql(
+        self,
+        *,
+        status: DocumentStatus | None,
+        statuses: Sequence[DocumentStatus] | None,
+        query: str | None,
+        include_deleted: bool,
+    ) -> tuple[str, list[Any]]:
+        """Return one parameterized predicate reused by document list and count."""
+
+        if isinstance(statuses, (str, bytes)):
+            raise ValueError("statuses must be a sequence of document statuses")
+        normalized_statuses: list[DocumentStatus] = []
+        candidates: list[DocumentStatus] = []
+        if status is not None:
+            candidates.append(DocumentStatus(status))
+        if statuses is not None:
+            candidates.extend(DocumentStatus(item) for item in statuses)
+        for candidate in candidates:
+            if candidate not in normalized_statuses:
+                normalized_statuses.append(candidate)
+
+        predicates: list[str] = []
+        parameters: list[Any] = []
+        if not include_deleted:
+            predicates.append("documents.status <> ?")
+            parameters.append(DocumentStatus.DELETED.value)
+        if normalized_statuses:
+            placeholders = ", ".join("?" for _item in normalized_statuses)
+            predicates.append(f"documents.status IN ({placeholders})")
+            parameters.extend(item.value for item in normalized_statuses)
+
+        normalized_query = self._validated_document_query(query)
+        if normalized_query is not None:
+            predicates.append(
+                "(instr(unicode_casefold(documents.display_name), ?) > 0 "
+                "OR instr(unicode_casefold(documents.extension), ?) > 0)"
+            )
+            search_key = unicode_casefold(normalized_query)
+            parameters.extend((search_key, search_key))
+
+        where_sql = f"WHERE {' AND '.join(predicates)}" if predicates else ""
+        return where_sql, parameters
 
     def get_ready_document_versions(
         self, document_ids: Sequence[str] | None = None
@@ -1945,6 +2003,21 @@ class Repository:
             raise ValueError(f"limit must be between 1 and {_MAX_PAGE_SIZE}")
         if offset < 0:
             raise ValueError("offset must be non-negative")
+
+    @staticmethod
+    def _validated_document_query(value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("query must be text")
+        if any(unicodedata.category(character).startswith("C") for character in value):
+            raise ValueError("query must contain only visible characters")
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if len(normalized) > 200:
+            raise ValueError("query must contain at most 200 visible characters")
+        return normalized
 
     @staticmethod
     def _validated_identifier(value: str, field: str) -> str:

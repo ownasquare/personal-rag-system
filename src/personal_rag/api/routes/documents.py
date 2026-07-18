@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Annotated, cast
@@ -15,8 +16,10 @@ from personal_rag.errors import RagError
 from personal_rag.models import (
     DocumentList,
     DocumentPublic,
+    DocumentSort,
     DocumentStatus,
     JobRecord,
+    SortOrder,
     UploadReceipt,
 )
 from personal_rag.parsers import safe_display_name
@@ -32,6 +35,24 @@ CONTENT_TYPES = {
     ".md": "text/markdown",
     ".txt": "text/plain",
 }
+MAX_DOCUMENT_QUERY_CHARACTERS = 200
+
+
+def _normalize_document_query(value: str | None) -> str | None:
+    """Normalize optional metadata search without retaining invisible control text."""
+
+    if value is None:
+        return None
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise RagError(
+            "invalid_document_query",
+            "Search text contains unsupported characters.",
+            status_code=422,
+        )
+    normalized = unicodedata.normalize("NFC", value).strip()
+    if not normalized:
+        return None
+    return normalized
 
 
 async def _stream_upload(
@@ -115,13 +136,25 @@ def list_documents(
     request: Request,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
-    status: DocumentStatus | None = None,
+    q: Annotated[str | None, Query(max_length=MAX_DOCUMENT_QUERY_CHARACTERS)] = None,
+    status: Annotated[list[DocumentStatus] | None, Query()] = None,
+    sort: DocumentSort = DocumentSort.CREATED,
+    order: SortOrder = SortOrder.DESC,
 ) -> DocumentList:
     repository = cast(Repository, request.app.state.container.repository)
-    records = repository.list_documents(limit=limit, offset=offset, status=status)
+    query = _normalize_document_query(q)
+    statuses = list(dict.fromkeys(status or [])) or None
+    records = repository.list_documents(
+        limit=limit,
+        offset=offset,
+        query=query,
+        statuses=statuses,
+        sort=sort,
+        order=order,
+    )
     return DocumentList(
         items=[DocumentPublic.from_record(record) for record in records],
-        total=repository.count_documents(status=status),
+        total=repository.count_documents(query=query, statuses=statuses),
         limit=limit,
         offset=offset,
     )

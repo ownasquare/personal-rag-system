@@ -24,6 +24,65 @@ def auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {fake_api.TOKEN}"}
 
 
+def test_document_library_query_is_literal_filtered_sorted_and_paginated(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    literal = client.get(
+        "/api/v1/documents",
+        params={"q": "RÉSUMÉ 100%_"},
+        headers=auth_headers,
+    )
+    assert literal.status_code == 200
+    assert literal.json()["total"] == 1
+    assert literal.json()["items"][0]["display_name"] == "Résumé 100%_plan.md"
+
+    decomposed = client.get(
+        "/api/v1/documents",
+        params={"q": "RE\u0301SUME\u0301"},
+        headers=auth_headers,
+    )
+    assert decomposed.status_code == 200
+    assert decomposed.json()["total"] == 1
+
+    cross_field = client.get(
+        "/api/v1/documents",
+        params={"q": "md .md"},
+        headers=auth_headers,
+    )
+    assert cross_field.status_code == 200
+    assert cross_field.json()["total"] == 0
+
+    filters = [
+        ("status", DocumentStatus.FAILED.value),
+        ("status", DocumentStatus.DELETION_FAILED.value),
+        ("sort", "name"),
+        ("order", "asc"),
+        ("limit", "3"),
+        ("offset", "0"),
+    ]
+    first = client.get("/api/v1/documents", params=filters, headers=auth_headers)
+    assert first.status_code == 200
+    payload = first.json()
+    assert payload["total"] > len(payload["items"])
+    assert [item["display_name"] for item in payload["items"]] == sorted(
+        item["display_name"] for item in payload["items"]
+    )
+    assert {item["status"] for item in payload["items"]} <= {
+        DocumentStatus.FAILED.value,
+        DocumentStatus.DELETION_FAILED.value,
+    }
+
+    second = client.get(
+        "/api/v1/documents",
+        params=[*filters[:-1], ("offset", "3")],
+        headers=auth_headers,
+    )
+    assert second.status_code == 200
+    assert {item["id"] for item in payload["items"]}.isdisjoint(
+        item["id"] for item in second.json()["items"]
+    )
+
+
 def test_reindex_progresses_to_ready_across_activity_reads(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:

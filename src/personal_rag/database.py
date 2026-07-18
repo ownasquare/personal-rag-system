@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -176,6 +177,14 @@ COMMIT;
 """
 
 
+def unicode_casefold(value: object) -> str:
+    """Return one deterministic Unicode search key for SQLite and Python callers."""
+
+    if value is None:
+        return ""
+    return unicodedata.normalize("NFKC", str(value)).casefold()
+
+
 class Database:
     """Create short-lived SQLite connections with one consistent safety policy."""
 
@@ -221,6 +230,12 @@ class Database:
             isolation_level=None,
         )
         connection.row_factory = sqlite3.Row
+        connection.create_function(
+            "unicode_casefold",
+            1,
+            unicode_casefold,
+            deterministic=True,
+        )
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         connection.execute("PRAGMA synchronous = NORMAL")

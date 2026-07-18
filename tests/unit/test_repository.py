@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -8,15 +9,17 @@ from pathlib import Path
 
 import pytest
 
-from personal_rag.database import SCHEMA_VERSION, Database
+from personal_rag.database import SCHEMA_VERSION, Database, unicode_casefold
 from personal_rag.errors import RagError
 from personal_rag.models import (
     Citation,
     ConversationTurnStatus,
+    DocumentSort,
     DocumentStatus,
     JobKind,
     JobStage,
     JobStatus,
+    SortOrder,
 )
 from personal_rag.repository import Repository
 
@@ -70,6 +73,80 @@ def create_upload(
     )
 
 
+def create_named_document(
+    repository: Repository,
+    display_name: str,
+    *,
+    document_id: str,
+    status: DocumentStatus = DocumentStatus.QUEUED,
+    extension: str = ".md",
+    created_at: datetime | None = None,
+    updated_at: datetime | None = None,
+) -> str:
+    """Create one uniquely-backed document and optionally set deterministic list metadata."""
+
+    receipt = repository.create_document_with_job(
+        document_id=document_id,
+        display_name=display_name,
+        stored_path=f"{document_id}{extension}",
+        content_type="text/markdown",
+        extension=extension,
+        content_sha256=hashlib.sha256(document_id.encode()).hexdigest(),
+        size_bytes=42,
+        embedding_fingerprint="f" * 64,
+    )
+    if status is not DocumentStatus.QUEUED or created_at is not None or updated_at is not None:
+        created = created_at or receipt.document.created_at
+        updated = updated_at or created
+        with repository.database.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                UPDATE documents
+                SET status = ?, active_version = ?, chunk_count = ?,
+                    created_at = ?, updated_at = ?, deleted_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status.value,
+                    1 if status is DocumentStatus.READY else 0,
+                    1 if status is DocumentStatus.READY else 0,
+                    created.isoformat(timespec="microseconds"),
+                    updated.isoformat(timespec="microseconds"),
+                    (
+                        updated.isoformat(timespec="microseconds")
+                        if status is DocumentStatus.DELETED
+                        else None
+                    ),
+                    document_id,
+                ),
+            )
+    return receipt.document.id
+
+
+def seed_findability_documents(repository: Repository, *, total: int = 36) -> None:
+    """Seed tied sort values across every public library status group."""
+
+    base = datetime(2026, 7, 1, 9, 0, tzinfo=UTC)
+    statuses = (
+        DocumentStatus.READY,
+        DocumentStatus.VALIDATING,
+        DocumentStatus.FAILED,
+        DocumentStatus.DELETION_FAILED,
+        DocumentStatus.DELETED,
+        DocumentStatus.QUEUED,
+    )
+    names = ("Alpha Report.md", "beta report.md", "Résumé Report.md", "Zulu Report.md")
+    for index in range(total):
+        create_named_document(
+            repository,
+            names[index % len(names)],
+            document_id=f"find-{index:02}",
+            status=statuses[index % len(statuses)],
+            created_at=base + timedelta(minutes=index // 3),
+            updated_at=base + timedelta(minutes=(total - index - 1) // 4),
+        )
+
+
 def mark_document_ready(repository: Repository, document_id: str) -> None:
     """Put a fixture document in authoritative retrieval-ready state."""
 
@@ -112,6 +189,22 @@ def test_database_initializes_wal_foreign_keys_and_schema(tmp_path: Path) -> Non
         "conversation_turns",
         "turn_citations",
     } <= tables
+
+
+def test_database_registers_deterministic_unicode_casefold_on_every_connection(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+
+    with database.connection() as first:
+        first_value = first.execute("SELECT unicode_casefold(?)", ("Straße",)).fetchone()[0]
+    with database.connection() as second:
+        second_value = second.execute("SELECT unicode_casefold(?)", ("\uff32ÉSUMÉ",)).fetchone()[0]
+
+    assert first_value == "strasse"
+    assert second_value == "résumé"
+    assert unicode_casefold("Straße") == first_value
 
 
 def test_v1_database_migrates_conversations_without_changing_documents(tmp_path: Path) -> None:
@@ -254,6 +347,185 @@ def test_document_and_job_listing_are_paginated_and_counted(repository: Reposito
         repository.list_documents(limit=0)
     with pytest.raises(ValueError, match="offset"):
         repository.list_jobs(offset=-1)
+
+
+def test_document_search_is_literal_unicode_and_counted(repository: Repository) -> None:
+    create_named_document(
+        repository,
+        "Résumé 100%_plan.md",
+        document_id="doc-special",
+        status=DocumentStatus.READY,
+    )
+    create_named_document(
+        repository,
+        "Resume 100X-plan.md",
+        document_id="doc-near-match",
+        status=DocumentStatus.READY,
+    )
+    create_named_document(
+        repository,
+        "Straße notes.txt",
+        document_id="doc-casefold",
+        status=DocumentStatus.READY,
+        extension=".txt",
+    )
+    create_named_document(
+        repository,
+        "folder/name [draft]*.txt",
+        document_id="doc-markdown",
+        status=DocumentStatus.READY,
+        extension=".txt",
+    )
+    create_named_document(
+        repository,
+        "O'Reilly #Roadmap.pdf",
+        document_id="doc-quote",
+        status=DocumentStatus.READY,
+        extension=".pdf",
+    )
+
+    assert [item.id for item in repository.list_documents(query="RÉSUMÉ 100%_")] == ["doc-special"]
+    assert repository.count_documents(query="RÉSUMÉ 100%_") == 1
+    assert [item.id for item in repository.list_documents(query="STRASSE")] == ["doc-casefold"]
+    assert [item.id for item in repository.list_documents(query="folder/name")] == ["doc-markdown"]
+    assert [item.id for item in repository.list_documents(query="[DRAFT]*")] == ["doc-markdown"]
+    assert [item.id for item in repository.list_documents(query="O'REILLY #")] == ["doc-quote"]
+    assert [item.id for item in repository.list_documents(query=".PDF")] == ["doc-quote"]
+
+
+def test_document_search_treats_sql_wildcards_as_literal_text(repository: Repository) -> None:
+    create_named_document(repository, "100% complete.md", document_id="doc-percent")
+    create_named_document(repository, "100 percent.md", document_id="doc-words")
+    create_named_document(repository, "under_score.md", document_id="doc-underscore")
+
+    assert [item.id for item in repository.list_documents(query="%")] == ["doc-percent"]
+    assert [item.id for item in repository.list_documents(query="_")] == ["doc-underscore"]
+
+
+def test_document_status_filters_use_or_semantics_and_preserve_single_status(
+    repository: Repository,
+) -> None:
+    seed_findability_documents(repository)
+
+    attention = repository.list_documents(
+        limit=200,
+        statuses=[DocumentStatus.FAILED, DocumentStatus.DELETION_FAILED],
+    )
+    combined = repository.list_documents(
+        limit=200,
+        status=DocumentStatus.READY,
+        statuses=[DocumentStatus.FAILED, DocumentStatus.FAILED],
+    )
+
+    assert len(attention) == 12
+    assert {item.status for item in attention} == {
+        DocumentStatus.FAILED,
+        DocumentStatus.DELETION_FAILED,
+    }
+    assert repository.count_documents(
+        statuses=[DocumentStatus.FAILED, DocumentStatus.DELETION_FAILED]
+    ) == len(attention)
+    assert len(combined) == 12
+    assert {item.status for item in combined} == {
+        DocumentStatus.READY,
+        DocumentStatus.FAILED,
+    }
+    assert repository.count_documents(status=DocumentStatus.READY) == 6
+    assert repository.count_documents(statuses=[]) == 30
+
+
+@pytest.mark.parametrize("sort", list(DocumentSort))
+@pytest.mark.parametrize("order", list(SortOrder))
+def test_document_sorts_have_stable_complete_page_boundaries(
+    repository: Repository,
+    sort: DocumentSort,
+    order: SortOrder,
+) -> None:
+    seed_findability_documents(repository)
+    all_items = repository.list_documents(limit=200, sort=sort, order=order)
+    reverse = order is SortOrder.DESC
+    if sort is DocumentSort.CREATED:
+        expected = sorted(all_items, key=lambda item: (item.created_at, item.id), reverse=reverse)
+    elif sort is DocumentSort.UPDATED:
+        expected = sorted(all_items, key=lambda item: (item.updated_at, item.id), reverse=reverse)
+    else:
+        expected = sorted(
+            all_items,
+            key=lambda item: (unicode_casefold(item.display_name), item.id),
+            reverse=reverse,
+        )
+
+    paged = []
+    for offset in range(0, repository.count_documents(), 7):
+        paged.extend(
+            repository.list_documents(
+                limit=7,
+                offset=offset,
+                sort=sort,
+                order=order,
+            )
+        )
+
+    assert len(all_items) == 30
+    assert [item.id for item in all_items] == [item.id for item in expected]
+    assert [item.id for item in paged] == [item.id for item in expected]
+    assert len({item.id for item in paged}) == len(paged)
+
+
+def test_document_filters_share_truthful_list_and_count_and_exclude_deleted(
+    repository: Repository,
+) -> None:
+    seed_findability_documents(repository)
+
+    listed = repository.list_documents(
+        limit=200,
+        query="REPORT",
+        statuses=[DocumentStatus.READY, DocumentStatus.FAILED],
+        sort=DocumentSort.NAME,
+        order=SortOrder.ASC,
+    )
+
+    assert len(listed) == 12
+    assert repository.count_documents(
+        query="REPORT",
+        statuses=[DocumentStatus.READY, DocumentStatus.FAILED],
+    ) == len(listed)
+    assert all(item.status is not DocumentStatus.DELETED for item in listed)
+    assert repository.list_documents(query="REPORT", statuses=[DocumentStatus.DELETED]) == []
+    assert repository.count_documents(query="REPORT", statuses=[DocumentStatus.DELETED]) == 0
+    assert (
+        repository.count_documents(
+            status=DocumentStatus.DELETED,
+            include_deleted=True,
+        )
+        == 6
+    )
+
+
+@pytest.mark.parametrize("query", ["line\nbreak", "nul\x00byte", "hidden\u200djoiner"])
+def test_document_search_rejects_non_visible_characters(
+    repository: Repository,
+    query: str,
+) -> None:
+    with pytest.raises(ValueError, match="visible"):
+        repository.list_documents(query=query)
+    with pytest.raises(ValueError, match="visible"):
+        repository.count_documents(query=query)
+
+
+def test_document_search_and_sort_validation_is_bounded(repository: Repository) -> None:
+    with pytest.raises(ValueError, match="200"):
+        repository.list_documents(query="x" * 201)
+    with pytest.raises(ValueError, match="text"):
+        repository.list_documents(query=123)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        repository.list_documents(sort="random")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        repository.list_documents(order="sideways")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="statuses"):
+        repository.list_documents(statuses="ready")  # type: ignore[arg-type]
+
+    assert repository.list_documents(query="   ") == []
 
 
 def test_lease_heartbeat_stage_and_completion_are_owner_safe(
