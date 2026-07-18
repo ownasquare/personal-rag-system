@@ -43,6 +43,9 @@ repository did not yet explain how strangers should evaluate, operate, or extend
 
 - `1899778` — initial public-adoption productization.
 - `169dcba` — adversarial release corrections, clean startup, concise proof, and visual preview.
+- `3014594` — public release record and adoption evidence.
+- `87c52f7` — browser-compatible preview asset correction.
+- `0ee02d9` — exact final container-image proof.
 
 ## Validation
 
