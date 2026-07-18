@@ -38,71 +38,53 @@ STATIC_STYLES = """
     border-right: 1px solid var(--line);
   }
 
-  .library-wordmark {
-    color: var(--accent);
-    font-size: 0.76rem;
-    font-weight: 750;
-    letter-spacing: 0.14em;
-    line-height: 1.2;
-    margin: 0 0 0.45rem;
-    text-transform: uppercase;
+  .library-header {
+    margin-bottom: 0.15rem;
   }
 
   h1.library-title {
     color: var(--ink);
     font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif;
-    font-size: clamp(1.8rem, 4vw, 3rem);
-    font-weight: 540;
-    letter-spacing: -0.035em;
-    line-height: 1.04;
+    font-size: clamp(1.45rem, 3vw, 1.85rem);
+    font-weight: 580;
+    letter-spacing: -0.025em;
+    line-height: 1.15;
     margin: 0;
-    max-width: 760px;
   }
 
   .library-subtitle {
     color: var(--muted);
-    font-size: 1rem;
-    line-height: 1.55;
-    margin: 0.7rem 0 0;
-    max-width: 680px;
-  }
-
-  .section-kicker {
-    color: var(--accent);
-    font-size: 0.72rem;
-    font-weight: 720;
-    letter-spacing: 0.11em;
-    margin-bottom: 0.25rem;
-    text-transform: uppercase;
+    font-size: 0.92rem;
+    line-height: 1.4;
+    margin: 0.25rem 0 0;
   }
 
   .onboarding-steps {
-    display: grid;
-    gap: 0.75rem;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    margin: 1.15rem 0 1.5rem;
+    align-items: center;
+    background: var(--paper-raised);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    font-size: 0.88rem;
+    gap: 0.45rem;
+    margin: 0.75rem 0 1rem;
+    padding: 0.68rem 0.8rem;
   }
 
   .onboarding-step {
-    background: var(--paper-raised);
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    min-height: 105px;
-    padding: 0.9rem 1rem;
+    align-items: center;
+    display: inline-flex;
+    gap: 0.35rem;
   }
 
   .onboarding-number {
     color: var(--accent);
-    font-family: ui-serif, Georgia, serif;
-    font-size: 1.25rem;
-    margin-bottom: 0.35rem;
+    font-weight: 750;
   }
 
-  .onboarding-copy {
-    color: var(--ink);
-    font-size: 0.9rem;
-    line-height: 1.42;
-  }
+  .onboarding-separator { color: var(--line); }
 
   div[data-testid="stSegmentedControl"] {
     margin: 1.3rem 0 1.65rem;
@@ -180,32 +162,15 @@ STATIC_STYLES = """
       padding: 1rem 0.85rem 3rem;
     }
 
-    h1.library-title {
-      font-size: 1.28rem;
-      letter-spacing: -0.02em;
-      line-height: 1.18;
-      max-width: none;
-    }
+    h1.library-title { font-size: 1.3rem; }
 
-    .library-subtitle {
-      display: none;
-    }
-
-    .library-wordmark {
-      margin-bottom: 0.3rem;
-    }
+    .library-subtitle { font-size: 0.84rem; }
 
     div[data-testid="stSegmentedControl"] {
       margin: 0.8rem 0 1.1rem;
     }
 
-    .onboarding-steps {
-      grid-template-columns: 1fr;
-    }
-
-    .onboarding-step {
-      min-height: 0;
-    }
+    .onboarding-steps { font-size: 0.82rem; }
 
     div[data-testid="stSegmentedControl"] label {
       font-size: 0.82rem;
@@ -222,26 +187,24 @@ STATIC_STYLES = """
 """
 
 HEADER_HTML = """
-<div class="library-wordmark">Personal Library</div>
-<h1 class="library-title">Your documents, ready when you need them.</h1>
-<p class="library-subtitle">
-  Keep notes and reference files in one private place, then find the part that matters.
-</p>
+<header class="library-header">
+  <h1 class="library-title">Personal Library</h1>
+  <p class="library-subtitle">Add documents, ask questions, and check the source.</p>
+</header>
 """
 
 ONBOARDING_STEPS_HTML = """
 <div class="onboarding-steps">
   <div class="onboarding-step">
-    <div class="onboarding-number">01</div>
-    <div class="onboarding-copy">Add a PDF, document, Markdown file, or text note.</div>
+    <span class="onboarding-number">1</span><span>Add files</span>
   </div>
+  <span class="onboarding-separator">→</span>
   <div class="onboarding-step">
-    <div class="onboarding-number">02</div>
-    <div class="onboarding-copy">Your library prepares it and keeps progress safely.</div>
+    <span class="onboarding-number">2</span><span>Wait until ready</span>
   </div>
+  <span class="onboarding-separator">→</span>
   <div class="onboarding-step">
-    <div class="onboarding-number">03</div>
-    <div class="onboarding-copy">Ask a question and open the exact passages used.</div>
+    <span class="onboarding-number">3</span><span>Ask and check sources</span>
   </div>
 </div>
 """
@@ -276,7 +239,7 @@ def job_action_label(kind: JobKind) -> str:
 
     return {
         JobKind.INGEST: "Adding",
-        JobKind.REINDEX: "Refreshing",
+        JobKind.REINDEX: "Reprocessing",
         JobKind.DELETE: "Removing",
     }[kind]
 
@@ -291,5 +254,11 @@ def job_status_label(status: JobStatus, stage: JobStage) -> str:
     if status is JobStatus.RETRYING:
         return "Trying again"
     if stage is JobStage.QUEUED:
-        return "Waiting to start"
-    return stage.value.replace("_", " ").capitalize()
+        return "Waiting"
+    if stage in {JobStage.VALIDATING, JobStage.EXTRACTING, JobStage.CHUNKING}:
+        return "Reading document"
+    if stage in {JobStage.EMBEDDING, JobStage.INDEXING, JobStage.VERIFYING}:
+        return "Preparing search"
+    if stage is JobStage.DELETING:
+        return "Removing document"
+    return "Working"

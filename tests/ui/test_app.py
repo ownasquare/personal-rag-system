@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from personal_rag.config import Settings
 from personal_rag.models import (
     ConversationTurnStatus,
     DependencyState,
@@ -46,6 +47,10 @@ def _selectbox(app: AppTest, label: str):  # type: ignore[no-untyped-def]
     return next(widget for widget in app.selectbox if widget.label == label)
 
 
+def _toggle(app: AppTest, label: str):  # type: ignore[no-untyped-def]
+    return next(widget for widget in app.toggle if widget.label == label)
+
+
 def _navigate(app: AppTest, section: str) -> AppTest:
     navigation = next(widget for widget in app.segmented_control if widget.label == "Workspace")
     navigation.set_value(section)
@@ -80,12 +85,54 @@ def test_empty_library_opens_a_complete_onboarding_flow(
     result = app_test.run()
 
     assert not result.exception
-    assert "Bring in something you already use" in _visible_text(result)
-    assert "Add a PDF, document, Markdown file" in _visible_text(result)
+    assert "Add your first documents" in _visible_text(result)
+    assert "Add files" in _visible_text(result)
     assert _button(result, "Add to library").disabled is True
     assert fake_client.list_conversations_calls == 0
     assert fake_client.health_live_calls == 0
     assert fake_client.health_ready_calls == 0
+
+
+def test_demo_mode_is_clearly_labeled(
+    app_test: AppTest, fake_client: FakeRagClient, ui_settings: Settings
+) -> None:
+    fake_client.documents = [make_document()]
+    fake_client.system_status = ready_status(document_count=1)
+    app_test.session_state["_rag_settings"] = ui_settings.model_copy(update={"demo_mode": True})
+
+    result = app_test.run()
+
+    assert "Demo mode" in _visible_text(result)
+    assert "Sample data resets" in _visible_text(result)
+
+
+def test_provider_setup_blocks_upload_everywhere(
+    app_test: AppTest, fake_client: FakeRagClient
+) -> None:
+    fake_client.system_status = SystemStatus(
+        status="needs_setup",
+        collection="personal_knowledge",
+        document_count=0,
+        ready_document_count=0,
+        chunk_count=0,
+        queued_job_count=0,
+        embedding_provider="openai",
+        embedding_model="text-embedding-3-large",
+        embedding_dimensions=3072,
+        chat_provider="openai",
+        chat_model="gpt-4.1-mini",
+        dependencies=[DependencyState(name="providers", status="not_configured")],
+    )
+
+    result = app_test.run()
+    assert "Connect a model provider" in _visible_text(result)
+    assert not result.file_uploader
+    assert _button(result, "Open system status")
+
+    result = _navigate(result, "Library")
+    assert "Connect a model provider" in _visible_text(result)
+    assert not result.file_uploader
+    assert not any(item.label == "Find a document" for item in result.text_input)
 
 
 def test_ready_workspace_defaults_to_ask_and_hides_operator_controls(
@@ -95,9 +142,13 @@ def test_ready_workspace_defaults_to_ask_and_hides_operator_controls(
 
     assert not result.exception
     assert "Ask your library" in _visible_text(result)
+    navigation = next(widget for widget in result.segmented_control if widget.label == "Workspace")
+    assert navigation.options == ["Ask", "Library", "Activity"]
     assert "New conversation" in _visible_text(result)
     assert "Sources to retrieve" not in _visible_text(result)
-    assert any(expander.label == "Where to look" for expander in result.expander)
+    assert any(expander.label == "Search options" for expander in result.expander)
+    examples = next(expander for expander in result.expander if expander.label == "Try an example")
+    assert examples.proto.expanded is False
     assert any(expander.label == "Saved conversations" for expander in result.expander)
     button_labels = [button.label for button in result.button]
     assert button_labels.index("Ask library") < button_labels.index("Summarize the main points")
@@ -137,6 +188,31 @@ def test_saved_conversation_management_is_secondary_but_reachable(
     assert previous.options == ["Atlas launch notes"]
 
 
+def test_newest_answer_is_immediate_and_older_answers_are_collapsed(
+    app_test: AppTest, fake_client: FakeRagClient
+) -> None:
+    fake_client.documents = [make_document()]
+    fake_client.system_status = ready_status(document_count=1)
+    fake_client.conversations = [make_conversation(turn_count=2)]
+    fake_client.turns = {
+        "conversation-1": [
+            make_turn(turn_id="turn-old", question="Older question"),
+            make_turn(turn_id="turn-new", question="Newest question"),
+        ]
+    }
+
+    result = app_test.run()
+
+    assert "Newest question" in _visible_text(result)
+    assert "Older question" not in _visible_text(result)
+    previous = _toggle(result, "Previous answers (1)")
+    assert previous.value is False
+
+    previous.set_value(True)
+    result = result.run()
+    assert "Older question" in _visible_text(result)
+
+
 def test_conditional_navigation_avoids_hidden_system_health_calls(
     app_test: AppTest, fake_client: FakeRagClient
 ) -> None:
@@ -145,24 +221,46 @@ def test_conditional_navigation_avoids_hidden_system_health_calls(
     fake_client.health_live_calls = 0
     fake_client.health_ready_calls = 0
 
-    result = _navigate(result, "Documents")
+    result = _navigate(result, "Library")
 
-    assert "Your library" in _visible_text(result)
-    assert fake_client.get_status_calls == 0
+    assert "Library" in _visible_text(result)
+    assert fake_client.get_status_calls == 1
     assert fake_client.health_live_calls == 0
     assert fake_client.health_ready_calls == 0
 
-    result = _navigate(result, "System")
+    _button(result, "System status").click()
+    result = result.run()
 
-    assert "System details" in _visible_text(result)
+    assert "System status" in _visible_text(result)
     assert fake_client.health_live_calls == 1
     assert fake_client.health_ready_calls == 1
+
+    result = _navigate(result, "Ask")
+    assert "Ask your library" in _visible_text(result)
+
+
+def test_system_status_can_return_to_the_already_selected_primary_section(
+    app_test: AppTest, fake_client: FakeRagClient
+) -> None:
+    result = _ready_app(app_test, fake_client)
+
+    _button(result, "System status").click()
+    result = result.run()
+
+    navigation = next(
+        widget for widget in result.segmented_control if widget.label == "Workspace"
+    )
+    assert navigation.value is None
+    assert "System status" in _visible_text(result)
+
+    result = _navigate(result, "Ask")
+    assert "Ask your library" in _visible_text(result)
 
 
 def test_multi_upload_reruns_into_immediately_visible_activity(
     app_test: AppTest, fake_client: FakeRagClient
 ) -> None:
-    result = _navigate(app_test.run(), "Documents")
+    result = _navigate(app_test.run(), "Library")
     result.file_uploader[0].set_value(
         [
             ("alpha.md", b"alpha", "text/markdown"),
@@ -191,7 +289,7 @@ def test_partial_upload_keeps_success_and_failure_feedback_together(
         message="This PDF could not be read.",
         status_code=422,
     )
-    result = _navigate(app_test.run(), "Documents")
+    result = _navigate(app_test.run(), "Library")
     result.file_uploader[0].set_value(
         [
             ("good.md", b"good", "text/markdown"),
@@ -218,7 +316,7 @@ def test_saved_conversation_is_restored_and_new_turn_uses_durable_api(
     result = app_test.run()
 
     assert "The launch key is cobalt [S1]." in _visible_text(result)
-    assert any(expander.label == "Source · 1" for expander in result.expander)
+    assert any(expander.label == "View source (1)" for expander in result.expander)
     assert "Relevance" not in _visible_text(result)
 
     _text_area(result, "Your question").set_value("What should I do next?")
@@ -370,24 +468,22 @@ def test_document_search_refresh_and_confirmed_removal(
         make_document("beta-plan.md", document_id="doc-beta"),
     ]
     fake_client.system_status = ready_status(document_count=2)
-    result = _navigate(app_test.run(), "Documents")
+    result = _navigate(app_test.run(), "Library")
 
     _text_input(result, "Find a document").set_value("beta")
     result = result.run()
-    _button(result, "Apply filters").click()
+    _button(result, "Search").click()
     result = result.run()
-    document_choices = next(
-        radio for radio in result.radio if radio.label == "Documents on this page"
-    )
+    document_choices = _selectbox(result, "Document")
     assert any("beta-plan.md" in option for option in document_choices.options)
     assert not any("alpha-notes.md" in option for option in document_choices.options)
 
-    _button(result, "Refresh document").click()
+    _button(result, "Reprocess for search").click()
     result = result.run()
     assert fake_client.reindex_calls == ["doc-beta"]
-    assert "Refreshing beta-plan.md" in _visible_text(result)
+    assert "Reprocessing beta-plan.md" in _visible_text(result)
 
-    result = _navigate(result, "Documents")
+    result = _navigate(result, "Library")
     _text_input(result, 'Type "beta-plan.md" to confirm removal').set_value("beta-plan.md")
     result = result.run()
     _button(result, "Remove beta-plan.md permanently").click()
@@ -407,15 +503,47 @@ def test_nonempty_documents_is_library_first_and_requests_one_page(
     result = app_test.run()
     ask_reads = fake_client.list_all_documents_calls
 
-    result = _navigate(result, "Documents")
+    result = _navigate(result, "Library")
 
     assert not result.exception
-    assert str(result.subheader[0].value) == "Your library"
-    assert any(expander.label == "Add documents" for expander in result.expander)
+    assert str(result.header[0].value) == "Library"
+    expander_labels = [expander.label for expander in result.expander]
+    assert expander_labels.index("Add documents") < expander_labels.index("Filter & sort")
+    manage = next(expander for expander in result.expander if expander.label == "Manage document")
+    assert manage.proto.expanded is False
     assert fake_client.list_all_documents_calls == ask_reads
     assert len(fake_client.document_page_requests) == 1
     assert fake_client.document_page_requests[0]["limit"] == 10
     assert len([item for item in result.text_input if item.label.startswith('Type "')]) == 1
+
+
+def test_ready_document_can_open_a_scoped_question(
+    app_test: AppTest, fake_client: FakeRagClient
+) -> None:
+    fake_client.documents = [make_document("launch.md")]
+    fake_client.system_status = ready_status(document_count=1)
+    result = _navigate(app_test.run(), "Library")
+
+    _button(result, "Ask about this document").click()
+    result = result.run()
+
+    assert "Ask your library" in _visible_text(result)
+    assert "Searching only: launch.md" in _visible_text(result)
+    scope = next(item for item in result.multiselect if item.label == "Documents")
+    assert scope.value == ["doc-1"]
+
+    _text_area(result, "Your question").set_value("What is the launch plan?")
+    result = result.run()
+    _button(result, "Ask library").click()
+    result = result.run()
+
+    assert fake_client.turn_calls[-1].document_ids == ["doc-1"]
+    assert "Searching only: launch.md" in _visible_text(result)
+
+    _button(result, "New conversation").click()
+    result = result.run()
+    assert result.session_state["question_document_scope"] == []
+    assert "Searching only:" not in _visible_text(result)
 
 
 def test_document_filters_are_applied_once_with_server_contract(
@@ -431,13 +559,16 @@ def test_document_filters_are_applied_once_with_server_contract(
         make_document("ready-notes.md", document_id="doc-ready"),
     ]
     fake_client.system_status = ready_status(document_count=3)
-    result = _navigate(app_test.run(), "Documents")
+    result = _navigate(app_test.run(), "Library")
     initial_requests = len(fake_client.document_page_requests)
 
     _text_input(result, "Find a document").set_value("notes")
     _selectbox(result, "Status").set_value("Needs attention")
     _selectbox(result, "Sort by").set_value("Name A-Z")
-    _button(result, "Apply filters").click()
+    assert result.session_state["document_query"] == ""
+    assert result.session_state["document_status_filter"] == "All"
+    assert result.session_state["document_sort"] == "Recently added"
+    _button(result, "Search").click()
     result = result.run()
 
     assert len(fake_client.document_page_requests) == initial_requests + 1
@@ -450,7 +581,7 @@ def test_document_filters_are_applied_once_with_server_contract(
     assert request["sort"] is DocumentSort.NAME
     assert request["order"] is SortOrder.ASC
     assert request["offset"] == 0
-    choices = next(radio for radio in result.radio if radio.label == "Documents on this page")
+    choices = _selectbox(result, "Document")
     assert choices.options == [
         "alpha-notes.md — Needs attention",
         "beta-notes.pdf — Needs attention",
@@ -464,12 +595,12 @@ def test_document_pagination_resets_when_filters_are_applied(
         make_document(f"file-{index:03d}.md", document_id=f"doc-{index:03d}") for index in range(21)
     ]
     fake_client.system_status = ready_status(document_count=21)
-    result = _navigate(app_test.run(), "Documents")
+    result = _navigate(app_test.run(), "Library")
 
     _button(result, "Next page").click()
     result = result.run()
     assert fake_client.document_page_requests[-1]["offset"] == 10
-    choices = next(radio for radio in result.radio if radio.label == "Documents on this page")
+    choices = _selectbox(result, "Document")
     assert result.session_state["selected_document_id"] in {
         document.id
         for document in fake_client.documents
@@ -478,7 +609,7 @@ def test_document_pagination_resets_when_filters_are_applied(
 
     _text_input(result, "Find a document").set_value("file-000")
     result = result.run()
-    _button(result, "Apply filters").click()
+    _button(result, "Search").click()
     result = result.run()
 
     assert fake_client.document_page_requests[-1]["offset"] == 0
@@ -492,7 +623,7 @@ def test_inconsistent_empty_boundary_page_recovers_without_crashing(
         make_document(f"file-{index:03d}.md", document_id=f"doc-{index:03d}") for index in range(11)
     ]
     fake_client.system_status = ready_status(document_count=11)
-    result = _navigate(app_test.run(), "Documents")
+    result = _navigate(app_test.run(), "Library")
 
     _button(result, "Next page").click()
     result = result.run()
@@ -513,10 +644,10 @@ def test_deletion_failure_offers_clear_retry_path(
     )
     fake_client.documents = [failed]
     fake_client.system_status = ready_status(document_count=1)
-    result = _navigate(app_test.run(), "Documents")
+    result = _navigate(app_test.run(), "Library")
 
     assert "Removal is incomplete" in _visible_text(result)
-    assert _button(result, "Refresh document").disabled is True
+    assert _button(result, "Reprocess for search").disabled is True
     assert _button(result, "Retry removal of field-notes.md").disabled is True
 
     _text_input(result, 'Type "field-notes.md" to confirm removal').set_value("field-notes.md")
@@ -546,8 +677,29 @@ def test_activity_restores_jobs_after_a_fresh_ui_session(
     assert not result.exception
     assert "In progress" in _visible_text(result)
     assert "Adding pending.md" in _visible_text(result)
-    assert "Refreshing pending.md" in _visible_text(result)
+    assert "Reprocessing pending.md" in _visible_text(result)
+    assert "Preparing search" in _visible_text(result)
+    assert "Embedding" not in _visible_text(result)
     assert fake_client.list_jobs_calls == 1
+
+
+def test_completed_activity_hands_off_to_ask(app_test: AppTest, fake_client: FakeRagClient) -> None:
+    fake_client.documents = [make_document("ready.md")]
+    fake_client.system_status = ready_status(document_count=1)
+    fake_client.jobs = {
+        "complete": make_job(
+            job_id="complete",
+            status=JobStatus.SUCCEEDED,
+            stage=JobStage.COMPLETE,
+        )
+    }
+
+    result = _navigate(app_test.run(), "Activity")
+
+    assert _button(result, "Ask your documents")
+    _button(result, "Ask your documents").click()
+    result = result.run()
+    assert "Ask your library" in _visible_text(result)
 
 
 def test_activity_separates_active_failed_and_completed_work(
@@ -571,7 +723,9 @@ def test_activity_separates_active_failed_and_completed_work(
     result = _navigate(app_test.run(), "Activity")
 
     headings = [str(element.value) for element in result.subheader]
-    assert headings == ["In progress", "Needs attention", "Completed"]
+    assert headings == ["In progress", "Needs attention"]
+    completed = next(expander for expander in result.expander if expander.label == "Completed (1)")
+    assert completed.proto.expanded is False
     assert fake_client.list_jobs_calls == 1
 
 
@@ -611,7 +765,7 @@ def test_provider_missing_state_explains_setup_without_a_question_form(
 
     result = app_test.run()
 
-    assert "One setup step remains" in _visible_text(result)
+    assert "Setup required" in _visible_text(result)
     assert not any(area.label == "Your question" for area in result.text_area)
 
 
@@ -638,11 +792,9 @@ def test_hostile_document_text_is_never_inserted_into_unsafe_html(
     fake_client.documents = [make_document(hostile_name)]
     fake_client.system_status = ready_status(document_count=1)
 
-    result = _navigate(app_test.run(), "Documents")
+    result = _navigate(app_test.run(), "Library")
 
-    document_choices = next(
-        radio for radio in result.radio if radio.label == "Documents on this page"
-    )
+    document_choices = _selectbox(result, "Document")
     assert any(hostile_name in option for option in document_choices.options)
     detail_heading = next(heading for heading in result.subheader if "script" in str(heading.value))
     assert r"\$x\$" in str(detail_heading.value)
@@ -729,7 +881,7 @@ def test_clean_upload_clears_an_older_batch_error(
         retryable=False,
     )
     fake_client.upload_errors = {"bad.md": failure}
-    result = _navigate(app_test.run(), "Documents")
+    result = _navigate(app_test.run(), "Library")
     result.file_uploader[0].set_value([("bad.md", b"bad", "text/markdown")])
     result = result.run()
     _button(result, "Add to library").click()

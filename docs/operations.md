@@ -14,12 +14,15 @@ providers and do not spend provider credits.
 ## Configure
 
 ```bash
-cp .env.example .env
-python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+python3 scripts/setup.py
+python3 scripts/setup.py --check
 ```
 
-Generate two different values and paste them into `RAG_API_KEY` and `RAG_QDRANT_API_KEY`,
-configure provider keys, and keep `.env` private.
+The setup assistant asks for the required OpenAI key without echoing it, generates different
+application and Qdrant tokens, writes `.env` with private file permissions, and never prints secret
+values. It refuses to overwrite an existing file. Use `.env.advanced.example` and the
+[configuration guide](configuration.md) for deliberate overrides.
+
 For Voyage embeddings, set provider/model/dimensions to `voyage`, `voyage-3-large`, and `1024`.
 OpenAI still supplies the answer model.
 
@@ -86,11 +89,10 @@ Open `http://127.0.0.1:8501`. FastAPI documentation is available at
   to multiple backend states with OR semantics.
 - Sort choices are recently added, recently updated, name A-Z, and name Z-A. Ten results appear per
   page with an exact filtered total and deterministic tie-breaking.
-- Select one document to expose its status, technical details, refresh action, and typed permanent
-  removal confirmation. On a phone, the detail follows the selection list; the interface labels
-  that relationship explicitly.
-- A non-empty library prioritizes filters and the working document list; **Add documents** remains
-  available afterward in a collapsed disclosure. An empty library opens upload immediately.
+- Select one document to expose its status. Reprocessing, technical details, and typed permanent
+  removal stay inside **Manage document** so normal reading remains uncluttered.
+- **Add documents** stays at the top of Library and opens automatically when the library is empty.
+- Status and sort choices stay under **Filter & sort**; search remains the primary visible control.
 - Search covers display-name and extension metadata, not document bodies, snippets, or vectors.
 
 This is a schema-v2-compatible application upgrade. It requires no migration, Qdrant mutation,
@@ -143,13 +145,15 @@ boundary.
 ```bash
 curl --fail http://127.0.0.1:8000/health/live
 curl --fail http://127.0.0.1:8000/health/ready
-curl --fail --header "Authorization: Bearer $RAG_API_KEY" http://127.0.0.1:8000/api/v1/status
+docker compose ps
 ```
 
 - Liveness proves only that the process can respond.
 - Readiness checks metadata, Qdrant, provider configuration, and worker freshness without a paid
   call. It also reconciles the exact expected and observed vector inventory.
-- Protected status explains each degraded dependency without returning secrets or storage paths.
+- Protected dependency detail is available through the UI's secondary **System status** view without
+  requiring users to export `.env` values into a shell. API clients may also call
+  `GET /api/v1/status` with the configured bearer token.
 
 Prometheus metrics are at `/metrics`. Place metrics behind the same private network boundary as
 the API.
@@ -212,6 +216,20 @@ tree is never treated as an authorized path.
 
 ## Troubleshooting
 
+Start with the narrowest read-only checks:
+
+```bash
+python3 scripts/setup.py --check
+docker compose ps
+curl --fail http://127.0.0.1:8000/health/live
+curl --fail http://127.0.0.1:8000/health/ready
+docker compose logs --tail=100 api worker ui qdrant
+```
+
+The setup check reports key names and configuration problems but never values. Review logs before
+restarting. `docker compose down` keeps data; `docker compose down --volumes` permanently removes
+application and vector volumes and should be used only for an intentional reset.
+
 - **Needs setup:** configure the embedding key and OpenAI answer key; readiness never tests them by
   making paid calls.
 - **Worker unavailable:** start `make worker`; queued documents remain durable and recover after
@@ -219,14 +237,15 @@ tree is never treated as an authorized path.
 - **Qdrant unavailable:** confirm the Qdrant version/host/port, API key, and private service health.
 - **Embedding profile mismatch:** restore the previous configuration or perform a deliberate full
   reindex. Do not point a new dimension at an existing collection.
-- **Document failed:** inspect its safe error code in Documents; encrypted, image-only, corrupt,
-  unsupported, empty, and oversized files require different corrective action.
-- **No documents match:** clear the query or choose **All**, then apply filters again. Search is
+- **Document failed:** open **Library**, choose the file, expand **Manage document**, and inspect
+  **Error code**. Encrypted, image-only, corrupt, unsupported, empty, and oversized files require
+  different corrective action.
+- **No documents match:** clear the query or choose **All**, then choose **Search** again. Search is
   literal metadata matching; it does not search words inside a file.
 - **Library page changed while loading:** the UI moves back one page automatically when a
   concurrent removal empties a boundary page. If the first page is momentarily inconsistent, use
   **Refresh library**; no document state is changed by this recovery.
-- **Library service error:** restore the API connection, then choose **Apply filters** again. The UI
+- **Library service error:** restore the API connection, then choose **Search** again. The UI
   does not discard stored documents when a page read fails.
 - **Question appears pending:** wait for the active reservation lease before retrying. The same
   client turn ID prevents a duplicate paid call; a retryable failed turn can safely be retried.

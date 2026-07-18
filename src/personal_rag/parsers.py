@@ -15,9 +15,9 @@ from llama_index.core import Document
 from pypdf import PdfReader
 
 from personal_rag.config import Settings
+from personal_rag.document_types import SUPPORTED_DOCUMENT_TYPES_LABEL, SUPPORTED_EXTENSIONS
 from personal_rag.errors import RagError
 
-_SUPPORTED_EXTENSIONS = frozenset({".pdf", ".docx", ".md", ".markdown", ".txt"})
 _PDF_SIGNATURE = b"%PDF-"
 _ZIP_SIGNATURES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 _OLE_SIGNATURE = bytes.fromhex("D0CF11E0A1B11AE1")
@@ -102,10 +102,10 @@ class DocumentParser:
     def parse(self, path: Path, display_name: str | None = None) -> list[Document]:
         source_path = Path(path)
         extension = source_path.suffix.lower()
-        if extension not in _SUPPORTED_EXTENSIONS:
+        if extension not in SUPPORTED_EXTENSIONS:
             raise RagError(
                 "unsupported_file_type",
-                "Supported document types are PDF, DOCX, Markdown, and plain text",
+                f"Supported document types are {SUPPORTED_DOCUMENT_TYPES_LABEL}",
                 status_code=415,
             )
         self._validate_path(source_path)

@@ -83,6 +83,20 @@ def test_document_library_query_is_literal_filtered_sorted_and_paginated(
     )
 
 
+def test_demo_upload_uses_the_shared_markdown_allowlist(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    response = client.post(
+        "/api/v1/documents",
+        files={"file": ("field-notes.markdown", b"# Notes\nA useful detail.", "text/markdown")},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["document"]["display_name"] == "field-notes.markdown"
+    assert response.json()["document"]["extension"] == ".markdown"
+
+
 def test_reindex_progresses_to_ready_across_activity_reads(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:

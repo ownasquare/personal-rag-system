@@ -37,20 +37,31 @@ def test_safe_display_name_removes_paths_controls_and_bounds_length() -> None:
     assert long_name.endswith(".pdf")
 
 
-def test_markdown_is_split_into_scalar_metadata_sections(
-    tmp_path: Path, settings: Settings
+@pytest.mark.parametrize("extension", [".md", ".markdown"])
+def test_markdown_suffixes_are_split_into_scalar_metadata_sections(
+    tmp_path: Path, settings: Settings, extension: str
 ) -> None:
-    path = tmp_path / "notes.md"
+    path = tmp_path / f"notes{extension}"
     path.write_text(
         "# Alpha\nFirst section.\n\n```md\n# Not a heading\n```\n\n## Beta\nSecond section.",
         encoding="utf-8",
     )
 
-    documents = DocumentParser(settings).parse(path, display_name="../My Notes.md")
+    documents = DocumentParser(settings).parse(
+        path,
+        display_name=f"../My Notes{extension}",
+    )
 
     assert [document.metadata["section"] for document in documents] == ["Alpha", "Beta"]
     assert "Not a heading" in documents[0].text
-    assert documents[0].metadata["source_name"] == "My Notes.md"
+    assert documents[0].metadata["source_name"] == f"My Notes{extension}"
+    assert {
+        "source_name",
+        "source_extension",
+        "parser_version",
+        "unit_index",
+        "section",
+    } <= documents[0].metadata.keys()
     assert all(
         isinstance(value, str | int | float | bool)
         for document in documents

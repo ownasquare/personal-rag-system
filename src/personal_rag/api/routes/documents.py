@@ -12,6 +12,10 @@ from typing import Annotated, cast
 import anyio
 from fastapi import APIRouter, File, Header, Query, Request, UploadFile
 
+from personal_rag.document_types import (
+    DOCUMENT_TYPES_BY_EXTENSION,
+    SUPPORTED_DOCUMENT_TYPES_LABEL,
+)
 from personal_rag.errors import RagError
 from personal_rag.models import (
     DocumentList,
@@ -29,12 +33,6 @@ from personal_rag.storage import managed_upload_key
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
-CONTENT_TYPES = {
-    ".pdf": "application/pdf",
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".md": "text/markdown",
-    ".txt": "text/plain",
-}
 MAX_DOCUMENT_QUERY_CHARACTERS = 200
 
 
@@ -80,7 +78,10 @@ async def _stream_upload(
 @router.post("", response_model=UploadReceipt, status_code=202)
 async def upload_document(
     request: Request,
-    file: Annotated[UploadFile, File(description="PDF, DOCX, Markdown, or text file")],
+    file: Annotated[
+        UploadFile,
+        File(description=f"Supported types: {SUPPORTED_DOCUMENT_TYPES_LABEL}"),
+    ],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> UploadReceipt:
     container = request.app.state.container
@@ -88,10 +89,11 @@ async def upload_document(
     settings = container.settings
     filename = safe_display_name(file.filename or "upload")
     extension = Path(filename).suffix.lower()
-    if extension not in CONTENT_TYPES:
+    document_type = DOCUMENT_TYPES_BY_EXTENSION.get(extension)
+    if document_type is None:
         raise RagError(
             "unsupported_file_type",
-            "Use a PDF, DOCX, Markdown, or text file.",
+            f"Use one of the supported document types: {SUPPORTED_DOCUMENT_TYPES_LABEL}.",
             status_code=415,
         )
 
@@ -112,7 +114,7 @@ async def upload_document(
             document_id=document_id,
             display_name=filename,
             stored_path=storage_key,
-            content_type=CONTENT_TYPES[extension],
+            content_type=document_type.content_type,
             extension=extension,
             content_sha256=content_hash,
             size_bytes=size_bytes,

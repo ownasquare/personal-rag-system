@@ -10,6 +10,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from personal_rag.document_types import DOCUMENT_TYPES_BY_EXTENSION
 from personal_rag.models import (
     ChatRequest,
     ChatResponse,
@@ -495,13 +496,8 @@ async def upload_document(
 ) -> UploadReceipt:
     filename = Path(file.filename or "upload").name
     extension = Path(filename).suffix.lower()
-    content_types = {
-        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ".md": "text/markdown",
-        ".pdf": "application/pdf",
-        ".txt": "text/plain",
-    }
-    if extension not in content_types:
+    document_type = DOCUMENT_TYPES_BY_EXTENSION.get(extension)
+    if document_type is None:
         await file.close()
         raise HTTPException(status_code=415, detail="unsupported file type")
     content = await file.read()
@@ -514,7 +510,7 @@ async def upload_document(
     document = DocumentPublic(
         id=document_id,
         display_name=filename,
-        content_type=content_types[extension],
+        content_type=document_type.content_type,
         extension=extension,
         size_bytes=len(content),
         status=DocumentStatus.QUEUED,

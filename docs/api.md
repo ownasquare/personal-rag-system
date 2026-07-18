@@ -12,7 +12,7 @@ Errors use one stable envelope:
 {
   "error": {
     "code": "unsupported_file_type",
-    "message": "Use a PDF, DOCX, Markdown, or text file.",
+    "message": "Use one of the supported document types: PDF, DOCX, Markdown, and text.",
     "retryable": false,
     "request_id": "5f09ecfb43bd45f7810e122c5e1735ab"
   }
@@ -55,7 +55,8 @@ filesystem paths.
 
 `POST /api/v1/documents` accepts one multipart field named `file` and returns `202` only after the
 document and durable job are stored. The optional `Idempotency-Key` header must contain 8-128
-URL-safe characters.
+URL-safe characters. Supported extensions are `.pdf`, `.docx`, `.md`, `.markdown`, and `.txt`;
+the API and UI derive this allowlist from the same typed registry.
 
 ```json
 {

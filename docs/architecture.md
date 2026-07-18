@@ -36,7 +36,9 @@ flowchart LR
 
 ### Upload and ingestion
 
-1. FastAPI streams an allowlisted file into a UUID staging path while enforcing the byte limit
+1. FastAPI, the parser, and Streamlit derive supported extensions from one immutable
+   `DocumentTypeSpec` registry. FastAPI streams an allowlisted file into a UUID staging path while
+   enforcing the byte limit
    and computing SHA-256.
 2. The original filename is retained only as a sanitized display name. The manifest stores a
    portable, server-generated relative key; every read/delete resolves that key beneath the

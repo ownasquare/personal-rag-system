@@ -10,6 +10,7 @@ from uuid import uuid4
 import streamlit as st
 
 from personal_rag.config import Settings, get_settings
+from personal_rag.document_types import SUPPORTED_DOCUMENT_TYPES_LABEL, UI_UPLOAD_SUFFIXES
 from personal_rag.models import (
     Citation,
     ConversationList,
@@ -40,8 +41,8 @@ from personal_rag.ui.presentation import (
     job_status_label,
 )
 
-SUPPORTED_FILE_TYPES = ["pdf", "docx", "md", "txt"]
-WORKSPACE_SECTIONS = ("Ask", "Documents", "Activity", "System")
+WORKSPACE_SECTIONS = ("Ask", "Library", "Activity")
+SECONDARY_SECTIONS = ("System",)
 TERMINAL_JOB_STATUSES = {JobStatus.SUCCEEDED, JobStatus.FAILED}
 MAX_CONVERSATIONS = 2_000
 TURN_WINDOW = 100
@@ -172,16 +173,25 @@ def _initialize_state() -> None:
     st.session_state.setdefault("document_query_draft", "")
     st.session_state.setdefault("document_status_draft", "All")
     st.session_state.setdefault("document_sort_draft", "Recently added")
+    st.session_state.setdefault("active_section", "Ask")
+    st.session_state.setdefault("workspace_section", "Ask")
+    if st.session_state.pop("_clear_question_scope_next", False):
+        st.session_state["question_document_scope"] = []
 
 
 def _apply_requested_section() -> None:
     requested = st.session_state.pop("_next_section", None)
-    if requested in WORKSPACE_SECTIONS:
-        st.session_state["workspace_section"] = requested
+    if requested in (*WORKSPACE_SECTIONS, *SECONDARY_SECTIONS):
+        st.session_state["active_section"] = requested
+        if requested in WORKSPACE_SECTIONS:
+            st.session_state["workspace_section"] = requested
+        else:
+            # Secondary screens should not leave a primary tab looking selected.
+            st.session_state["workspace_section"] = None
 
 
 def _request_section(section: str) -> None:
-    if section not in WORKSPACE_SECTIONS:
+    if section not in (*WORKSPACE_SECTIONS, *SECONDARY_SECTIONS):
         raise ValueError(f"Unknown workspace section: {section}")
     st.session_state["_next_section"] = section
     st.rerun()
@@ -281,6 +291,12 @@ def _providers_configured(status: SystemStatus | None) -> bool:
     return not any(dependency.status == "not_configured" for dependency in status.dependencies)
 
 
+def _render_setup_notice() -> None:
+    st.warning("Connect a model provider before adding documents or asking questions.")
+    if st.button("Open system status", type="primary"):
+        _request_section("System")
+
+
 def _escape_markdown(value: str) -> str:
     return _MARKDOWN_CONTROL.sub(r"\\\1", value)
 
@@ -290,17 +306,24 @@ def _render_header() -> None:
     st.markdown(HEADER_HTML, unsafe_allow_html=True)
 
 
+def _select_primary_section() -> None:
+    selected = st.session_state.get("workspace_section")
+    if selected in WORKSPACE_SECTIONS:
+        st.session_state["active_section"] = selected
+
+
 def _render_navigation() -> str:
-    section = st.segmented_control(
+    st.segmented_control(
         "Workspace",
         options=WORKSPACE_SECTIONS,
-        default=None if "workspace_section" in st.session_state else "Ask",
         selection_mode="single",
         label_visibility="collapsed",
         key="workspace_section",
         width="stretch",
+        on_change=_select_primary_section,
     )
-    return section if isinstance(section, str) else "Ask"
+    section = st.session_state.get("active_section", "Ask")
+    return section if section in (*WORKSPACE_SECTIONS, *SECONDARY_SECTIONS) else "Ask"
 
 
 def _track_job(job: JobRecord, *, document_name: str) -> None:
@@ -323,13 +346,13 @@ def _render_upload(
     if heading:
         st.subheader(heading, anchor=False)
     st.caption(
-        "PDF, DOCX, Markdown, and text files are supported. Nothing is added until you confirm."
+        f"{SUPPORTED_DOCUMENT_TYPES_LABEL} · up to {format_bytes(settings.upload_max_bytes)} each"
     )
     uploads = st.file_uploader(
         "Choose documents",
-        type=SUPPORTED_FILE_TYPES,
+        type=UI_UPLOAD_SUFFIXES,
         accept_multiple_files=True,
-        help=f"Each file can be up to {format_bytes(settings.upload_max_bytes)}.",
+        help="Review your selection, then choose Add to library.",
         key=f"{key_prefix}-files",
     )
     add_clicked = st.button(
@@ -380,9 +403,7 @@ def _render_upload(
 
 
 def _render_onboarding(client: UiClient, settings: Settings) -> None:
-    st.markdown('<div class="section-kicker">Start here</div>', unsafe_allow_html=True)
-    st.header("Bring in something you already use", anchor=False)
-    st.write("A project brief, meeting notes, a handbook, or a research PDF is enough to begin.")
+    st.header("Add your first documents", anchor=False)
     # This is a trusted static fragment; file names are rendered only through Streamlit widgets.
     st.markdown(ONBOARDING_STEPS_HTML, unsafe_allow_html=True)
     with st.container(border=True):
@@ -393,6 +414,10 @@ def _reset_pending_turn_state() -> None:
     st.session_state["pending_client_turn_id"] = None
     st.session_state["pending_turn_payload"] = None
     st.session_state["turn_error"] = None
+
+
+def _clear_question_scope() -> None:
+    st.session_state["question_document_scope"] = []
 
 
 def _resolve_conversation_id(conversations: list[ConversationSummary]) -> str | None:
@@ -435,6 +460,7 @@ def _render_saved_conversations(
                 st.session_state["selected_conversation_id"] = None
                 st.session_state["starting_new_conversation"] = True
                 st.session_state["confirm_delete_conversation"] = False
+                st.session_state["_clear_question_scope_next"] = True
                 _reset_pending_turn_state()
                 st.session_state.pop("conversation_picker", None)
                 st.rerun()
@@ -496,6 +522,7 @@ def _render_saved_conversations(
                         st.session_state["selected_conversation_id"] = None
                         st.session_state["starting_new_conversation"] = True
                         st.session_state["confirm_delete_conversation"] = False
+                        st.session_state["_clear_question_scope_next"] = True
                         st.session_state.pop("conversation_picker", None)
                         st.rerun()
             with cancel:
@@ -507,8 +534,8 @@ def _render_saved_conversations(
 def _render_sources(citations: list[Citation]) -> None:
     if not citations:
         return
-    source_word = "Source" if len(citations) == 1 else "Sources"
-    with st.expander(f"{source_word} · {len(citations)}"):
+    source_label = "View source" if len(citations) == 1 else "View sources"
+    with st.expander(f"{source_label} ({len(citations)})"):
         for index, citation in enumerate(citations):
             metadata = [citation.document_name]
             if citation.page_number is not None:
@@ -581,6 +608,30 @@ def _suggest_question(text: str, *, key: str, draft_version: int) -> None:
         st.rerun()
 
 
+def _render_question_examples() -> None:
+    draft_version = int(st.session_state["question_draft_version"])
+    with st.expander("Try an example"):
+        suggestions = st.columns(3)
+        with suggestions[0]:
+            _suggest_question(
+                "Summarize the main points",
+                key=f"suggest-summary-{draft_version}",
+                draft_version=draft_version,
+            )
+        with suggestions[1]:
+            _suggest_question(
+                "What decisions were made?",
+                key=f"suggest-decisions-{draft_version}",
+                draft_version=draft_version,
+            )
+        with suggestions[2]:
+            _suggest_question(
+                "What should I follow up on?",
+                key=f"suggest-followup-{draft_version}",
+                draft_version=draft_version,
+            )
+
+
 def _render_question_form(
     client: UiClient,
     settings: Settings,
@@ -593,10 +644,35 @@ def _render_question_form(
         if bool(error_state.get("retryable")):
             st.caption("Your exact question is still here. Choose Ask library to try again.")
 
-    st.subheader("Ask a question", anchor=False)
     document_names = {document.id: document.display_name for document in ready_documents}
     draft_version = int(st.session_state["question_draft_version"])
     draft_key = f"question_draft_{draft_version}"
+
+    scope_value = st.session_state.get("question_document_scope", [])
+    selected_scope = (
+        [document_id for document_id in scope_value if document_id in document_names]
+        if isinstance(scope_value, list)
+        else []
+    )
+    if selected_scope != scope_value:
+        st.session_state["question_document_scope"] = selected_scope
+    if selected_scope:
+        scope_label = (
+            document_names[selected_scope[0]]
+            if len(selected_scope) == 1
+            else f"{len(selected_scope)} selected documents"
+        )
+        scope_column, clear_column = st.columns([5, 1], vertical_alignment="center")
+        with scope_column:
+            st.caption(f"Searching only: {scope_label}")
+        with clear_column:
+            st.button(
+                "Clear",
+                key="clear-question-scope",
+                type="tertiary",
+                help="Search every ready document instead.",
+                on_click=_clear_question_scope,
+            )
 
     with st.form("library-question-form", clear_on_submit=False):
         question = st.text_area(
@@ -604,10 +680,10 @@ def _render_question_form(
             key=draft_key,
             placeholder="What do these documents say about…",
             max_chars=settings.max_query_characters,
-            height=105,
+            height=88,
         )
         top_k = min(settings.retrieval_top_k, settings.retrieval_max_top_k)
-        with st.expander("Where to look"):
+        with st.expander("Search options"):
             st.caption("Leave the document selection empty to search everything that is ready.")
             selected_document_ids = st.multiselect(
                 "Documents",
@@ -625,27 +701,6 @@ def _render_question_form(
                 key="question_top_k",
             )
         submitted = st.form_submit_button("Ask library", type="primary", width="stretch")
-
-    st.caption("Not sure where to start?")
-    suggestions = st.columns(3)
-    with suggestions[0]:
-        _suggest_question(
-            "Summarize the main points",
-            key=f"suggest-summary-{draft_version}",
-            draft_version=draft_version,
-        )
-    with suggestions[1]:
-        _suggest_question(
-            "What decisions were made?",
-            key=f"suggest-decisions-{draft_version}",
-            draft_version=draft_version,
-        )
-    with suggestions[2]:
-        _suggest_question(
-            "What should I follow up on?",
-            key=f"suggest-followup-{draft_version}",
-            draft_version=draft_version,
-        )
 
     if not submitted:
         return
@@ -709,25 +764,22 @@ def _render_question_form(
 
 def _render_ask(client: UiClient, settings: Settings) -> None:
     status, status_error = _safe_status(client)
+    if status_error is not None or status is None:
+        st.error(status_error.message if status_error is not None else "Status is unavailable.")
+        st.info("Your saved work is untouched. Restore the knowledge service, then refresh.")
+        return
+    if not _providers_configured(status):
+        st.header("Setup required", anchor=False)
+        _render_setup_notice()
+        return
+
     documents, documents_error = _safe_documents(client)
     if documents_error is not None:
         st.error(documents_error.message)
         st.info("Your saved work is untouched. Restore the knowledge service, then refresh.")
         return
-    if status_error is not None or status is None:
-        st.error(status_error.message if status_error is not None else "Status is unavailable.")
-        st.info("Your saved work is untouched. Restore the knowledge service, then refresh.")
-        return
     if not documents:
         _render_onboarding(client, settings)
-        return
-    if not _providers_configured(status):
-        st.header("One setup step remains", anchor=False)
-        st.warning(
-            "Connect the document and answer providers on the server before asking questions."
-        )
-        if st.button("Open system details"):
-            _request_section("System")
         return
 
     ready_documents = [
@@ -740,9 +792,7 @@ def _render_ask(client: UiClient, settings: Settings) -> None:
             _request_section("Activity")
         return
 
-    st.markdown('<div class="section-kicker">Ask</div>', unsafe_allow_html=True)
     st.header("Ask your library", anchor=False)
-    st.caption("Saved conversations come back after a refresh, with their source passages intact.")
 
     conversation_page, conversation_error = _safe_conversations(client)
     if conversation_error is not None:
@@ -777,23 +827,30 @@ def _render_ask(client: UiClient, settings: Settings) -> None:
         ready_documents,
         conversation_id,
     )
-    _render_saved_conversations(client, conversations, conversation_id)
-    if saved_conversation_note is not None:
-        st.caption(saved_conversation_note)
     if turns_error is not None:
         st.error(turns_error.message)
     elif turns_page is not None:
         if not turns_page.items:
             st.caption("This conversation is ready for its first question.")
         else:
-            st.subheader("Conversation", anchor=False)
             if turns_page.total > len(turns_page.items):
                 st.caption(
                     f"Showing the {len(turns_page.items)} most recent of "
                     f"{turns_page.total} saved questions."
                 )
-            for turn in turns_page.items:
-                _render_turn(client, turn)
+            newest_turn = turns_page.items[-1]
+            _render_turn(client, newest_turn)
+            previous_turns = turns_page.items[:-1]
+            if previous_turns and st.toggle(
+                f"Previous answers ({len(previous_turns)})",
+                key=f"previous-answers-{conversation_id}",
+            ):
+                for turn in reversed(previous_turns):
+                    _render_turn(client, turn)
+    _render_question_examples()
+    _render_saved_conversations(client, conversations, conversation_id)
+    if saved_conversation_note is not None:
+        st.caption(saved_conversation_note)
 
 
 def _run_document_action(
@@ -832,29 +889,31 @@ def _render_document_filters() -> None:
     status_labels = list(DOCUMENT_STATUS_GROUPS)
     sort_labels = list(DOCUMENT_SORT_OPTIONS)
     with st.form("document-filter-form"):
-        search_column, status_column, sort_column = st.columns([2, 1, 1])
-        with search_column:
-            st.text_input(
-                "Find a document",
-                placeholder="Search filenames and file types",
-                max_chars=DOCUMENT_QUERY_MAX_CHARACTERS,
-                key="document_query_draft",
-            )
-        with status_column:
-            st.selectbox(
-                "Status",
-                options=status_labels,
-                key="document_status_draft",
-            )
-        with sort_column:
-            st.selectbox(
-                "Sort by",
-                options=sort_labels,
-                key="document_sort_draft",
-            )
+        st.text_input(
+            "Find a document",
+            placeholder="Search by file name or type",
+            max_chars=DOCUMENT_QUERY_MAX_CHARACTERS,
+            help="Searches file names and extensions, not document contents.",
+            key="document_query_draft",
+        )
+        with st.expander("Filter & sort"):
+            status_column, sort_column = st.columns(2)
+            with status_column:
+                st.selectbox(
+                    "Status",
+                    options=status_labels,
+                    key="document_status_draft",
+                )
+            with sort_column:
+                st.selectbox(
+                    "Sort by",
+                    options=sort_labels,
+                    key="document_sort_draft",
+                )
         st.form_submit_button(
-            "Apply filters",
+            "Search",
             type="primary",
+            width="stretch",
             on_click=_apply_document_filters,
         )
 
@@ -875,7 +934,15 @@ def _render_document_detail(client: UiClient, document: DocumentPublic) -> None:
     else:
         st.info("This document is still being prepared.")
 
-    with st.expander("Technical details"):
+    if document.status is DocumentStatus.READY and st.button(
+        "Ask about this document",
+        key=f"ask-document-{document.id}",
+        type="primary",
+    ):
+        st.session_state["question_document_scope"] = [document.id]
+        _request_section("Ask")
+
+    with st.expander("Manage document"):
         st.caption(
             f"Content type: {document.content_type} · "
             f"Version: {document.active_version} · "
@@ -884,37 +951,41 @@ def _render_document_detail(client: UiClient, document: DocumentPublic) -> None:
         if document.error_code:
             st.caption(f"Error code: {document.error_code}")
 
-    can_refresh = document.status in {DocumentStatus.READY, DocumentStatus.FAILED}
-    if st.button(
-        "Refresh document",
-        key=f"refresh-document-{document.id}",
-        disabled=not can_refresh,
-    ):
-        _run_document_action(client.reindex_document, document=document)
+        can_reprocess = document.status in {DocumentStatus.READY, DocumentStatus.FAILED}
+        if st.button(
+            "Reprocess for search",
+            key=f"reprocess-document-{document.id}",
+            disabled=not can_reprocess,
+        ):
+            _run_document_action(client.reindex_document, document=document)
 
-    st.markdown("**Remove document**")
-    st.caption("This removes the stored file, its search index, and saved answers that cite it.")
-    confirmation = st.text_input(
-        f'Type "{document.display_name}" to confirm removal',
-        key=f"delete-confirm-{document.id}",
-    )
-    delete_label = (
-        f"Retry removal of {document.display_name}"
-        if document.status is DocumentStatus.DELETION_FAILED
-        else f"Remove {document.display_name} permanently"
-    )
-    if st.button(
-        delete_label,
-        key=f"delete-document-{document.id}",
-        disabled=confirmation != document.display_name,
-    ):
-        _run_document_action(client.delete_document, document=document)
+        st.markdown("**Remove document**")
+        st.caption(
+            "This permanently removes the stored file, its search index, "
+            "and saved answers that cite it."
+        )
+        confirmation = st.text_input(
+            f'Type "{document.display_name}" to confirm removal',
+            key=f"delete-confirm-{document.id}",
+        )
+        delete_label = (
+            f"Retry removal of {document.display_name}"
+            if document.status is DocumentStatus.DELETION_FAILED
+            else f"Remove {document.display_name} permanently"
+        )
+        if st.button(
+            delete_label,
+            key=f"delete-document-{document.id}",
+            disabled=confirmation != document.display_name,
+        ):
+            _run_document_action(client.delete_document, document=document)
 
 
 def _render_documents(client: UiClient, settings: Settings) -> None:
-    st.markdown('<div class="section-kicker">Documents</div>', unsafe_allow_html=True)
-    st.header("Documents", anchor=False)
-    st.subheader("Your library", anchor=False)
+    st.header("Library", anchor=False)
+
+    status, status_error = _safe_status(client)
+    uploads_enabled = status_error is None and _providers_configured(status)
 
     query = str(st.session_state["document_query"]).strip()
     status_label = str(st.session_state["document_status_filter"])
@@ -939,11 +1010,14 @@ def _render_documents(client: UiClient, settings: Settings) -> None:
     )
     has_filters = bool(query) or status_label != "All"
     library_is_empty = page is not None and page.total == 0 and not has_filters
-    if library_is_empty:
-        with st.expander("Add documents", expanded=True):
+    with st.expander("Add documents", expanded=library_is_empty):
+        if uploads_enabled:
             _render_upload(client, settings, key_prefix="documents")
+        elif status_error is not None:
+            st.warning("Setup status is unavailable, so adding documents is paused.")
+        else:
+            _render_setup_notice()
 
-    _render_document_filters()
     if page_error is not None:
         st.error(page_error.message)
         st.info(
@@ -952,6 +1026,11 @@ def _render_documents(client: UiClient, settings: Settings) -> None:
         return
     if page is None:
         return
+    if page.total == 0 and not has_filters:
+        st.info("Your library is empty. Add a document to begin.")
+        return
+
+    _render_document_filters()
     if page.total > 0 and offset >= page.total:
         st.session_state["document_offset"] = ((page.total - 1) // DOCUMENT_PAGE_SIZE) * (
             DOCUMENT_PAGE_SIZE
@@ -971,12 +1050,7 @@ def _render_documents(client: UiClient, settings: Settings) -> None:
             st.rerun()
         return
     if page.total == 0:
-        if has_filters:
-            st.info("No documents match the applied filters.")
-            with st.expander("Add documents", expanded=False):
-                _render_upload(client, settings, key_prefix="documents")
-        else:
-            st.info("Your library is empty. Add a document to begin.")
+        st.info("No documents match the applied filters.")
         return
 
     first_position = page.offset + 1
@@ -995,15 +1069,14 @@ def _render_documents(client: UiClient, settings: Settings) -> None:
 
     list_column, detail_column = st.columns([2, 3], vertical_alignment="top")
     with list_column:
-        st.caption("Choose a document · details appear alongside or below")
-        selected_id = st.radio(
-            "Documents on this page",
+        selected_id = st.selectbox(
+            "Document",
             options=visible_ids,
             format_func=lambda document_id: (
                 f"{document_names[document_id]} — {document_states[document_id]}"
             ),
             key="selected_document_id",
-            label_visibility="collapsed",
+            help="Choose a file to view its details and actions.",
         )
     selected_document = next(document for document in page.items if document.id == selected_id)
     with detail_column, st.container(border=True):
@@ -1026,9 +1099,6 @@ def _render_documents(client: UiClient, settings: Settings) -> None:
         ):
             st.session_state["document_offset"] = page.offset + DOCUMENT_PAGE_SIZE
             st.rerun()
-
-    with st.expander("Add documents", expanded=False):
-        _render_upload(client, settings, key_prefix="documents")
 
 
 def _activity_document_name(
@@ -1062,10 +1132,11 @@ def _render_activity_rows(
     failed = [job for job in jobs_page.items if job.status is JobStatus.FAILED]
     completed = [job for job in jobs_page.items if job.status is JobStatus.SUCCEEDED]
 
-    def render_jobs(heading: str, jobs: list[JobRecord]) -> None:
+    def render_jobs(heading: str, jobs: list[JobRecord], *, show_heading: bool = True) -> None:
         if not jobs:
             return
-        st.subheader(heading, anchor=False)
+        if show_heading:
+            st.subheader(heading, anchor=False)
         for job in jobs:
             document_name = _activity_document_name(job, document_names, tracked_jobs)
             action = job_action_label(job.kind)
@@ -1078,9 +1149,8 @@ def _render_activity_rows(
                     st.write(job_status_label(job.status, job.stage))
                 if job.status not in TERMINAL_JOB_STATUSES:
                     st.progress(job.progress, text=job_status_label(job.status, job.stage))
-                    st.caption("You can close this page; progress is saved by the service.")
                 elif job.status is JobStatus.FAILED:
-                    st.warning("This work needs attention. Open Documents to inspect and retry.")
+                    st.warning("This work needs attention. Open Library to inspect and retry.")
                     if job.error_code:
                         with st.expander("Error details"):
                             st.caption(f"Error code: {job.error_code}")
@@ -1090,18 +1160,17 @@ def _render_activity_rows(
     if active:
         render_jobs("In progress", active)
     render_jobs("Needs attention", failed)
-    render_jobs("Completed", completed)
-    if (failed or completed) and not active:
-        st.caption("Showing the most recent saved activity.")
+    if completed:
+        with st.expander(f"Completed ({len(completed)})"):
+            render_jobs("Completed", completed, show_heading=False)
     return bool(active)
 
 
 def _render_activity(client: UiClient) -> None:
-    st.markdown('<div class="section-kicker">Activity</div>', unsafe_allow_html=True)
     heading, refresh = st.columns([4, 1], vertical_alignment="center")
     with heading:
-        st.header("Recent activity", anchor=False)
-        st.caption("Processing is stored by the service and comes back after a refresh.")
+        st.header("Activity", anchor=False)
+        st.caption("Processing continues if you close this page.")
     with refresh:
         if st.button("Refresh", width="stretch"):
             st.rerun()
@@ -1121,7 +1190,11 @@ def _render_activity(client: UiClient) -> None:
 
     has_active = _render_activity_rows(client, documents)
     if has_active:
-        st.caption("Choose Refresh to check the latest progress.")
+        st.caption("Refresh to check the latest progress.")
+    elif any(document.status is DocumentStatus.READY for document in documents) and st.button(
+        "Ask your documents", type="primary"
+    ):
+        _request_section("Ask")
 
 
 def _health_label(check_call: Callable[[], HealthCheck]) -> str:
@@ -1132,10 +1205,9 @@ def _health_label(check_call: Callable[[], HealthCheck]) -> str:
 
 
 def _render_system(client: UiClient) -> None:
-    st.markdown('<div class="section-kicker">System</div>', unsafe_allow_html=True)
     heading, refresh = st.columns([4, 1], vertical_alignment="center")
     with heading:
-        st.header("System details", anchor=False)
+        st.header("System status", anchor=False)
         st.caption("For setup and troubleshooting. Credentials never appear in this workspace.")
     with refresh:
         if st.button("Refresh", key="refresh-system", width="stretch"):
@@ -1156,7 +1228,7 @@ def _render_system(client: UiClient) -> None:
         st.error(status_error.message)
         return
     if status is None:
-        st.warning("System details are not available right now.")
+        st.warning("System status is not available right now.")
         return
 
     if not _providers_configured(status):
@@ -1204,15 +1276,26 @@ def main() -> None:
         st.stop()
 
     _render_header()
+    if settings.demo_mode:
+        st.info("Demo mode · Sample data resets when the demo stops.")
     section = _render_navigation()
     if section == "Ask":
         _render_ask(client, settings)
-    elif section == "Documents":
+    elif section == "Library":
         _render_documents(client, settings)
     elif section == "Activity":
         _render_activity(client)
     else:
         _render_system(client)
+
+    if section != "System":
+        st.divider()
+        if st.button(
+            "System status",
+            type="tertiary",
+            help="Setup, service health, and model details.",
+        ):
+            _request_section("System")
 
 
 main()

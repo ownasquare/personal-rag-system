@@ -1,5 +1,7 @@
 # Security and Privacy
 
+For private vulnerability disclosure, see the repository-level [security policy](../SECURITY.md).
+
 ## Protected assets
 
 The system protects document bytes, extracted text, vector embeddings, saved conversations,
@@ -33,7 +35,7 @@ requires a separate API key.
 
 ## Upload controls
 
-- Allowed extensions are `.pdf`, `.docx`, `.md`, and `.txt`.
+- Allowed extensions are `.pdf`, `.docx`, `.md`, `.markdown`, and `.txt`.
 - Backend signature checks are authoritative; Streamlit's file filter is only a convenience.
 - File bytes are streamed into a UUID path, bounded during the stream, hashed with SHA-256, and
   stored with mode `0600`.

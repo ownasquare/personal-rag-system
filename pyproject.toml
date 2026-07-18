@@ -4,15 +4,20 @@ build-backend = "hatchling.build"
 
 [project]
 name = "personal-rag-system"
-version = "0.1.0"
-description = "Production-grade single-user personal retrieval-augmented generation system"
+version = "0.2.0"
+description = "Self-hosted document library with grounded answers and inspectable source passages"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Personal RAG Contributors" }]
+keywords = ["rag", "document-search", "fastapi", "streamlit", "qdrant", "llamaindex"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Framework :: FastAPI",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX",
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]

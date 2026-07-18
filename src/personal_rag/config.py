@@ -43,7 +43,8 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_name: str = "Personal Knowledge Studio"
+    app_name: str = "Personal Library"
+    demo_mode: bool = False
     environment: Literal["development", "test", "production"] = "development"
     host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)

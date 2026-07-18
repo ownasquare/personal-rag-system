@@ -1,11 +1,15 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help sync lock test test-live coverage lint format typecheck security check api worker ui qdrant compose-up compose-down
+.PHONY: help sync lock setup check-config demo test test-live coverage lint format typecheck security public check api worker ui qdrant compose-up compose-down
 
 help:
 	@echo "sync          Install the locked runtime and development environment"
+	@echo "setup         Create a private .env without printing secret values"
+	@echo "check-config  Validate .env without printing secret values"
+	@echo "demo          Start the no-provider demo on loopback port 8512"
 	@echo "test          Run deterministic tests without paid provider calls"
 	@echo "test-live     Explicitly run the paid provider smoke test"
+	@echo "public        Check the tracked tree for public-release hygiene"
 	@echo "check         Run lint, formatting, typing, security, and tests"
 	@echo "api           Start FastAPI on the configured loopback address"
 	@echo "worker        Start the durable ingestion worker"
@@ -18,6 +22,15 @@ sync:
 
 lock:
 	uv lock
+
+setup:
+	uv run python scripts/setup.py
+
+check-config:
+	uv run python scripts/setup.py --check
+
+demo:
+	uv run python scripts/demo.py
 
 test:
 	uv run pytest -q -m "not live" --disable-socket --allow-unix-socket
@@ -43,7 +56,10 @@ security:
 	uv run bandit -q -r src scripts
 	uv run pip-audit
 
-check: lint typecheck security coverage
+public:
+	uv run python scripts/check_public_repo.py
+
+check: lint typecheck security public coverage
 
 api:
 	uv run uvicorn personal_rag.api.app:app --host 127.0.0.1 --port 8000 --workers 1 --no-access-log

@@ -681,6 +681,28 @@ def test_upload_returns_durable_job(
     assert "content_sha256" not in payload["document"]
 
 
+def test_upload_accepts_long_markdown_suffix_with_canonical_content_type(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    repository: FakeRepository,
+    settings: Settings,
+) -> None:
+    response = client.post(
+        "/api/v1/documents",
+        headers=auth_headers,
+        files={"file": ("field-notes.markdown", b"# Field notes", "application/octet-stream")},
+    )
+
+    assert response.status_code == 202
+    payload = response.json()["document"]
+    assert payload["display_name"] == "field-notes.markdown"
+    assert payload["extension"] == ".markdown"
+    assert payload["content_type"] == "text/markdown"
+    record = next(iter(repository.documents.values()))
+    assert record.content_type == "text/markdown"
+    assert (settings.uploads_dir / record.stored_path).suffix == ".markdown"
+
+
 def test_upload_rejects_unsupported_and_empty_files(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
