@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v6
         with:
           version: "0.8.17"
@@ -36,7 +36,7 @@ jobs:
       RAG_QDRANT_API_KEY: ci-qdrant-token-different-32-characters
       RAG_OPENAI_API_KEY: ci-openai-key-not-valid-no-network
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - name: Validate and build the Compose topology
         run: |
