@@ -47,7 +47,8 @@ jobs:
       - name: Wait for API, worker, vector inventory, and UI readiness
         run: |
           for attempt in {1..60}; do
-            if curl --fail --silent http://127.0.0.1:8000/health/ready > /tmp/personal-rag-ready.json; then
+            if curl --fail --silent http://127.0.0.1:8000/health/ready > /tmp/personal-rag-ready.json \
+              && curl --fail --silent http://127.0.0.1:8501/_stcore/health > /tmp/personal-rag-ui-health.txt; then
               break
             fi
             if [ "$attempt" -eq 60 ]; then
@@ -57,7 +58,6 @@ jobs:
             fi
             sleep 2
           done
-          curl --fail --silent http://127.0.0.1:8501/_stcore/health
           docker compose exec -T ui python -c "from pathlib import Path; assert Path('/app/.streamlit/config.toml').is_file()"
       - name: Stop smoke stack
         if: always()
