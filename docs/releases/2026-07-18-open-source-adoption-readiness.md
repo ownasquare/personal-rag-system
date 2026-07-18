@@ -7,6 +7,18 @@ interface without a provider key, configure a real local library through one set
 follow a short Add → Process → Ask → Check the source workflow. Contributors have a repository map,
 extension recipes, deterministic tests, community templates, and an explicit proof boundary.
 
+## Publication
+
+- Public repository: <https://github.com/ownasquare/personal-rag-system>
+- The public `main` CI gate passed both quality and container jobs at commit `f50f4cf`:
+  <https://github.com/ownasquare/personal-rag-system/actions/runs/29664884668>
+- GitHub dependency graph, Dependabot alerts, security updates, grouped security updates, malware
+  alerts, secret protection, push protection, and private vulnerability reporting are enabled.
+- Repository topics cover RAG, document search, the core Python stack, and the supported providers
+  so the project is discoverable without adding interface clutter.
+- Dependabot opened its initial version-update pull requests automatically. They remain unmerged
+  pending normal review and validation.
+
 ## Why this release was needed
 
 The earlier application was feature-complete but still read like an internal implementation. Setup
@@ -46,6 +58,8 @@ repository did not yet explain how strangers should evaluate, operate, or extend
 - `3014594` — public release record and adoption evidence.
 - `87c52f7` — browser-compatible preview asset correction.
 - `0ee02d9` — exact final container-image proof.
+- `6e9edb9` — public repository URLs and clone instructions.
+- `f50f4cf` — hosted CI readiness retry for the Streamlit service.
 
 ## Validation
 
@@ -56,6 +70,7 @@ repository did not yet explain how strangers should evaluate, operate, or extend
   provider/worker checks, protected status readback, and no provider network call.
 - Browser proof: desktop 1440 × 1000, tablet 768 × 1024, and phone 390 × 844 with no horizontal
   overflow across the core Ask, Library, Activity, scoped-search, and System flows.
+- Hosted GitHub Actions proof: quality and container jobs passed on the public `main` branch.
 
 Detailed evidence and reproduction commands are in [Validation](../validation.md).
 
