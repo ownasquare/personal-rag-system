@@ -21,6 +21,7 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
 dependencies = [
   "fastapi==0.139.2",
   "filelock>=3.19,<4",
@@ -45,6 +46,11 @@ dependencies = [
   "uvicorn[standard]==0.51.0",
   "voyageai==0.3.7",
 ]
+
+[project.urls]
+Homepage = "https://github.com/ownasquare/personal-rag-system"
+Repository = "https://github.com/ownasquare/personal-rag-system"
+Issues = "https://github.com/ownasquare/personal-rag-system/issues"
 
 [dependency-groups]
 dev = [

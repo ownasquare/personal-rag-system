@@ -21,6 +21,8 @@ Document processing and answers are simulated; uploaded files are temporary and 
 real retrieval in this tour:
 
 ```bash
+git clone https://github.com/ownasquare/personal-rag-system.git
+cd personal-rag-system
 uv sync --all-groups --frozen
 uv run python scripts/demo.py
 ```
