@@ -7,6 +7,9 @@ now presented as **Personal Library**: a calm, familiar document workspace rathe
 AI chat demo. The release adds durable cited conversations and visible operational recovery while
 preserving the original stateless chat API for compatibility.
 
+Validated implementation commit: `de69b90254e5404e3d4a3abd90406d78d307d984` on local `main`.
+No Git remote is configured, so this release is committed locally and was not pushed.
+
 ## Product outcome
 
 The primary interface now has four plainly named areas:
