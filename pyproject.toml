@@ -40,7 +40,7 @@ dependencies = [
   "python-docx>=1.2,<2",
   "python-multipart==0.0.32",
   "qdrant-client==1.18.0",
-  "streamlit==1.59.2",
+  "streamlit==1.60.0",
   "structlog>=25.4,<26",
   "tenacity>=9.1,<10",
   "uvicorn[standard]==0.51.0",
